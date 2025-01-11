@@ -1,0 +1,7 @@
+discord.py>=2.3.2
+python-dotenv>=1.0.0
+aiohttp>=3.8.5
+python-dateutil>=2.8.2
+asyncio>=3.4.3
+typing-extensions>=4.7.1
+nltk>=3.8.1 
