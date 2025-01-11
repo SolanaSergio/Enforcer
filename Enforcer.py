@@ -307,73 +307,60 @@ class ProfileAnalyzer:
 
 class ScamDetector:
     def __init__(self):
-        self.scam_patterns = {
-            'phishing': [
-                r'discord\s*nitro\s*free',
-                r'steam\s*gift\s*free',
-                r'free\s*nitro\s*generator',
-                r'claim\s*your\s*nitro',
-                r'nitro\s*giveaway',
-                r'@everyone\s*free',
-                r'discord\s*staff\s*here',
-            ],
-            'impersonation': [
-                r'discord\s*mod(?:erator)?',
-                r'discord\s*admin(?:istrator)?',
-                r'official\s*staff',
-                r'server\s*staff',
-            ],
-            'malicious_links': [
-                r'dlscord\.(?:gift|com)',
-                r'steamcommunnity\.com',
-                r'dlscordnitro\.gift',
-                r'discordgift\.site',
-            ]
-        }
         self.known_scam_domains = set()
         self.phishing_patterns = set()
         self.recent_scams = defaultdict(list)  # guild_id -> List[recent scam messages]
         self.shared_scam_alerts = defaultdict(list)  # For cross-server alerts
 
-    async def add_scam_domain(self, domain: str):
-        """Add a domain to the known scam domains list"""
-        self.known_scam_domains.add(domain.lower())
-
-    async def remove_scam_domain(self, domain: str):
-        """Remove a domain from the known scam domains list"""
-        self.known_scam_domains.discard(domain.lower())
-
-    async def add_scam_attempt(self, guild_id: int, content: str, categories: List[str]):
-        """Add a scam attempt to the recent scams list"""
-        self.recent_scams[guild_id].append({
-            'content': content,
-            'categories': categories,
-            'timestamp': datetime.now(timezone.utc)
-        })
-        # Keep only last 50 scams per guild
-        if len(self.recent_scams[guild_id]) > 50:
-            self.recent_scams[guild_id].pop(0)
-
     async def analyze_message(self, message: discord.Message) -> tuple[bool, str, list]:
-        """Enhanced analysis of a message for scam patterns"""
+        """Analyze a message for scam patterns"""
         detected_categories = []
         content = message.content.lower()
         
-        # Check each category of scam patterns
-        for category, patterns in self.scam_patterns.items():
-            for pattern in patterns:
-                if re.search(pattern, content):
-                    detected_categories.append(category)
-                    break
-
+        # Ignore legitimate bot commands
+        if content.startswith('!'):
+            valid_commands = ['reportscam', 'recentscams', 'scaminfo', 'checkuser', 'reportdm', 
+                            'checkname', 'previewlink', 'scamdomains', 'scamexamples', 
+                            'securityguide', 'securitytip', 'sharescam', 'help']
+            command = content[1:].split()[0]  # Get the command without the prefix
+            if command in valid_commands:
+                return False, "", []
+        
         # Check for known scam domains
         urls = re.findall(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+[^\s]*', content)
         for url in urls:
-            domain = url.split('/')[2]
+            domain = urlparse(url).netloc
             if domain in self.known_scam_domains:
                 detected_categories.append("malicious_domain")
-            elif any(scam_domain in domain for scam_domain in self.scam_patterns['malicious_links']):
-                detected_categories.append("suspicious_domain")
+
+        # Check for phishing patterns
+        phishing_patterns = [
+            r'discord\s*nitro\s*free',
+            r'steam\s*gift\s*free',
+            r'free\s*nitro\s*generator',
+            r'claim\s*your\s*nitro',
+            r'nitro\s*giveaway',
+            r'@everyone\s*free',
+            r'discord\s*staff\s*here',
+        ]
+        
+        for pattern in phishing_patterns:
+            if re.search(pattern, content):
+                detected_categories.append("phishing")
+                break
+
+        # Check for impersonation attempts
+        impersonation_patterns = [
+            r'discord\s*mod(?:erator)?',
+            r'discord\s*admin(?:istrator)?',
+            r'official\s*staff',
+            r'server\s*staff',
+        ]
+        
+        for pattern in impersonation_patterns:
+            if re.search(pattern, content):
+                detected_categories.append("impersonation")
+                break
 
         # Check message characteristics
         if message.mention_everyone or len(message.mentions) > 5:
@@ -382,7 +369,7 @@ class ScamDetector:
         if len(urls) > 2:
             detected_categories.append("multiple_links")
 
-        # Generate detailed reason if scam detected
+        # Generate reason if scam detected
         is_scam = len(detected_categories) > 0
         reason = self._generate_reason(detected_categories) if is_scam else ""
 
@@ -407,6 +394,25 @@ class ScamDetector:
         reasons = [category_descriptions.get(cat, cat) for cat in categories]
         return "Detected: " + ", ".join(reasons)
 
+    async def add_scam_domain(self, domain: str):
+        """Add a domain to the known scam domains list"""
+        self.known_scam_domains.add(domain.lower())
+
+    async def remove_scam_domain(self, domain: str):
+        """Remove a domain from the known scam domains list"""
+        self.known_scam_domains.discard(domain.lower())
+
+    async def add_scam_attempt(self, guild_id: int, content: str, categories: List[str]):
+        """Add a scam attempt to the recent scams list"""
+        self.recent_scams[guild_id].append({
+            'content': content,
+            'categories': categories,
+            'timestamp': datetime.now(timezone.utc)
+        })
+        # Keep only last 50 scams per guild
+        if len(self.recent_scams[guild_id]) > 50:
+            self.recent_scams[guild_id].pop(0)
+
     async def share_scam_alert(self, guild_id: int, alert: dict):
         """Share a scam alert with other servers"""
         self.shared_scam_alerts[guild_id].append({
@@ -430,6 +436,15 @@ class MessageAnalyzer:
             "similarity_score": 0.0,
             "reasons": []
         }
+
+        # Ignore legitimate bot commands
+        if message.content.startswith('!'):
+            valid_commands = ['reportscam', 'recentscams', 'scaminfo', 'checkuser', 'reportdm', 
+                            'checkname', 'previewlink', 'scamdomains', 'scamexamples', 
+                            'securityguide', 'securitytip', 'sharescam', 'help']
+            command = message.content[1:].lower().split()[0]  # Get the command without the prefix
+            if command in valid_commands:
+                return results
 
         # Add message to history
         self.message_history[user_id].append({
@@ -710,6 +725,103 @@ class LinkPreview:
     def __init__(self):
         self.preview_cache = {}
         self.cache_duration = 3600  # 1 hour cache
+        self.suspicious_patterns = {
+            'domain': [
+                r'dlsc[o0]rd',  # Discord typosquatting
+                r'st[e3]am',    # Steam typosquatting
+                r'free.*nitro',
+                r'nitro.*free',
+                r'gift.*steam',
+                r'steam.*gift',
+                r'giveaway',
+                r'claim.*reward'
+            ],
+            'path': [
+                r'verify',
+                r'login',
+                r'auth',
+                r'claim',
+                r'gift',
+                r'redeem'
+            ],
+            'tld': [
+                '.xyz', '.tk', '.ml', '.ga', '.cf', '.gq'  # Common free TLDs used in scams
+            ]
+        }
+
+    def calculate_link_safety_score(self, url: str) -> dict:
+        """Calculate a safety score for a URL based on various factors"""
+        try:
+            parsed = urlparse(url)
+            score = 1.0  # Start with perfect score
+            reasons = []
+            
+            # Check domain
+            domain = parsed.netloc.lower()
+            for pattern in self.suspicious_patterns['domain']:
+                if re.search(pattern, domain):
+                    score -= 0.2
+                    reasons.append(f"Suspicious domain pattern: {pattern}")
+            
+            # Check path
+            path = parsed.path.lower()
+            for pattern in self.suspicious_patterns['path']:
+                if re.search(pattern, path):
+                    score -= 0.1
+                    reasons.append(f"Suspicious path pattern: {pattern}")
+            
+            # Check TLD
+            tld = '.' + domain.split('.')[-1]
+            if tld in self.suspicious_patterns['tld']:
+                score -= 0.15
+                reasons.append(f"Suspicious TLD: {tld}")
+            
+            # Length checks
+            if len(domain) > 30:
+                score -= 0.1
+                reasons.append("Unusually long domain name")
+            
+            if len(url) > 100:
+                score -= 0.1
+                reasons.append("Unusually long URL")
+            
+            # Number checks
+            if sum(c.isdigit() for c in domain) > 5:
+                score -= 0.1
+                reasons.append("Excessive numbers in domain")
+            
+            # Special character checks
+            if domain.count('-') > 2:
+                score -= 0.1
+                reasons.append("Excessive hyphens in domain")
+            
+            # Normalize score between 0 and 1
+            final_score = max(min(score, 1.0), 0.0)
+            
+            return {
+                'score': final_score,
+                'rating': self._get_safety_rating(final_score),
+                'reasons': reasons
+            }
+        except Exception:
+            return {
+                'score': 0.0,
+                'rating': 'Invalid',
+                'reasons': ['Invalid URL format']
+            }
+
+    def _get_safety_rating(self, score: float) -> str:
+        """Convert score to human-readable rating"""
+        if score >= 0.8:
+            return "Safe"
+        elif score >= 0.6:
+            return "Probably Safe"
+        elif score >= 0.4:
+            return "Suspicious"
+        elif score >= 0.2:
+            return "High Risk"
+        else:
+            return "Very Dangerous"
 
     async def get_screenshot(self, url: str) -> Optional[str]:
         """Get a screenshot of a URL using Selenium Wire"""
@@ -752,45 +864,6 @@ class LinkPreview:
             ])
         except Exception:
             return False
-
-class StaffNotifier:
-    def __init__(self):
-        self.notification_channels = defaultdict(set)  # guild_id -> set of channel_ids
-        self.last_notification = defaultdict(float)  # guild_id -> last notification time
-        self.cooldown = 300  # 5 minutes between notifications
-
-    async def add_notification_channel(self, guild_id: int, channel_id: int):
-        """Add a channel for staff notifications"""
-        self.notification_channels[guild_id].add(channel_id)
-
-    async def remove_notification_channel(self, guild_id: int, channel_id: int):
-        """Remove a channel from staff notifications"""
-        self.notification_channels[guild_id].discard(channel_id)
-
-    async def notify_staff(self, guild: discord.Guild, embed: discord.Embed, urgent: bool = False):
-        """Send notification to staff channels"""
-        current_time = time.time()
-        
-        # Check cooldown unless urgent
-        if not urgent and current_time - self.last_notification[guild.id] < self.cooldown:
-            return
-
-        self.last_notification[guild.id] = current_time
-        
-        # Add timestamp to embed
-        embed.timestamp = datetime.now(timezone.utc)
-        
-        # Send to all notification channels
-        for channel_id in self.notification_channels[guild.id]:
-            channel = guild.get_channel(channel_id)
-            if channel and isinstance(channel, discord.TextChannel):
-                try:
-                    await channel.send(
-                        content="🚨 **URGENT STAFF NOTIFICATION**" if urgent else None,
-                        embed=embed
-                    )
-                except discord.Forbidden:
-                    continue
 
 class UsernameChecker:
     def __init__(self):
@@ -881,7 +954,7 @@ class Enforcer(commands.Bot):
         super().__init__(
             command_prefix='!',
             intents=intents,
-            description='Security and moderation bot for Discord',
+            description='Community safety and scam reporting bot for Discord',
             **options
         )
         
@@ -889,44 +962,19 @@ class Enforcer(commands.Bot):
         self.db = EnforcerDatabase()
         self.trust_rating = TrustRating()
         self.profile_analyzer = ProfileAnalyzer()
-        self._scam_detector = None
-        self._message_analyzer = None
-        self._raid_protector = None
-        self._verification_system = None
-        
-        # Initialize settings
-        self.shared_scam_alerts = {}
-        self._last_cleanup = 0
-        self._cleanup_interval = 3600  # Cleanup every hour
-        
-        # DM Protection settings
-        self.dm_protection = defaultdict(lambda: {
-            'enabled': False,
-            'warn_users': True,
-            'block_new_accounts': False,
-            'minimum_age_days': 7
-        })
-
-        # Server lockdown settings
-        self.lockdown_settings = defaultdict(lambda: {
-            'active': False,
-            'start_time': None,
-            'restrictions': {
-                'block_dms': True,
-                'block_invites': True,
-                'block_links': True,
-                'minimum_age': 30  # days
-            }
-        })
-
-        # Add new components
+        self.scam_detector = ScamDetector()  # Initialize scam detector properly
+        self.message_analyzer = MessageAnalyzer()  # Initialize message analyzer properly
         self.pattern_learner = ScamPatternLearner()
         self.community_db = CommunityScamDB()
         self.dm_screener = DMScreener()
         self.username_detector = UsernameImpersonationDetector()
         self.link_preview = LinkPreview()
-        self.staff_notifier = StaffNotifier()
         self.username_checker = UsernameChecker()
+        self.security_education = SecurityEducation()
+
+        # Initialize cleanup variables
+        self._last_cleanup = time.time()
+        self._cleanup_interval = 3600  # Cleanup every hour
 
         # Add commands
         self.add_commands()
@@ -941,7 +989,7 @@ class Enforcer(commands.Bot):
         async def help_command(ctx):
             embed = discord.Embed(
                 title="🛡️ Enforcer Bot Commands",
-                description="Here are all available commands:",
+                description="Here are all available commands to help keep our community safe:",
                 color=discord.Color.blue()
             )
 
@@ -953,17 +1001,7 @@ class Enforcer(commands.Bot):
                       "`!reportdm @user` - Report suspicious DMs\n"
                       "`!reportscam` - Report a scam attempt\n"
                       "`!checkname [@user]` - Check for similar usernames\n"
-                      "`!previewlink [url]` - Get a safe preview of a link",
-                inline=False
-            )
-
-            # Server Protection
-            embed.add_field(
-                name="🔒 Server Protection",
-                value="`!lockdown` - View lockdown status\n"
-                      "`!lockdown enable [duration]` - Enable lockdown\n"
-                      "`!lockdown disable` - Disable lockdown\n"
-                      "`!staffchannel add/remove` - Set up staff notification channel",
+                      "`!previewlink [url]` - Get a safe preview and security scan of a link",
                 inline=False
             )
 
@@ -971,19 +1009,28 @@ class Enforcer(commands.Bot):
             embed.add_field(
                 name="🚫 Scam Prevention",
                 value="`!scamdomains list` - List known scam domains\n"
-                      "`!scamdomains add [domain]` - Add domain to blacklist\n"
-                      "`!scamdomains remove [domain]` - Remove domain from blacklist\n"
                       "`!scamexamples` - View examples of common scams",
                 inline=False
             )
 
-            # Statistics & Monitoring
+            # Security Education
             embed.add_field(
-                name="📊 Statistics",
-                value="`!recentscams` - View recent scam attempts\n"
-                      "`!scamstats` - View scam prevention stats",
+                name="📚 Security Education",
+                value="`!securityguide` - View security guides and topics\n"
+                      "`!securityguide [topic]` - View detailed guide on a topic\n"
+                      "`!securitytip` - Get a random security tip",
                 inline=False
             )
+
+            # Moderation Commands
+            if ctx.author.guild_permissions.manage_messages:
+                embed.add_field(
+                    name="🛠️ Moderation",
+                    value="`!recentscams` - View recent scam attempts in the server\n"
+                          "`!sharescam` - Share scam alerts with other servers\n"
+                          "`!scamdomains add/remove` - Manage scam domain blacklist",
+                    inline=False
+                )
 
             await ctx.send(embed=embed)
 
@@ -1114,103 +1161,6 @@ class Enforcer(commands.Bot):
             except Exception as e:
                 await ctx.send(f"❌ An error occurred: {str(e)}")
 
-        @self.command(name='lockdown')
-        @commands.has_permissions(administrator=True)
-        async def lockdown(ctx, action: str = None, duration: int = 60):
-            try:
-                if not ctx.guild:
-                    await ctx.send("❌ This command can only be used in a server!")
-                    return
-
-                if action is None:
-                    # Show current status
-                    settings = self.lockdown_settings[ctx.guild.id]
-                    if settings['active']:
-                        time_remaining = (settings['start_time'] + timedelta(minutes=duration) - datetime.now(timezone.utc)).total_seconds() / 60
-                        await ctx.send(f"🔒 Server is in lockdown mode. {time_remaining:.1f} minutes remaining.")
-                    else:
-                        await ctx.send("🔓 Server is not in lockdown mode.")
-                    return
-
-                if action.lower() == 'enable':
-                    self.lockdown_settings[ctx.guild.id]['active'] = True
-                    self.lockdown_settings[ctx.guild.id]['start_time'] = datetime.now(timezone.utc)
-                    
-                    embed = discord.Embed(
-                        title="🔒 Server Lockdown Enabled",
-                        description="Emergency protection measures are now active:",
-                        color=discord.Color.red()
-                    )
-                    embed.add_field(
-                        name="Restrictions",
-                        value="• DMs between members blocked\n"
-                              "• Server invites blocked\n"
-                              "• Links blocked\n"
-                              f"• Minimum account age: {self.lockdown_settings[ctx.guild.id]['restrictions']['minimum_age']} days",
-                        inline=False
-                    )
-                    embed.add_field(
-                        name="Duration",
-                        value=f"Lockdown will last for {duration} minutes",
-                        inline=False
-                    )
-                    
-                    await ctx.send(embed=embed)
-                    
-                    # Schedule lockdown end
-                    await asyncio.sleep(duration * 60)
-                    if self.lockdown_settings[ctx.guild.id]['active']:
-                        self.lockdown_settings[ctx.guild.id]['active'] = False
-                        await ctx.send("🔓 Lockdown period has ended. Server restrictions lifted.")
-                        
-                elif action.lower() == 'disable':
-                    self.lockdown_settings[ctx.guild.id]['active'] = False
-                    await ctx.send("🔓 Lockdown mode disabled. Server restrictions lifted.")
-                else:
-                    await ctx.send("❌ Invalid action! Use `enable` or `disable`")
-            except Exception as e:
-                await ctx.send(f"❌ An error occurred: {str(e)}")
-
-        @self.command(name='scamstats')
-        async def scamstats(ctx):
-            try:
-                if not ctx.guild:
-                    await ctx.send("❌ This command can only be used in a server!")
-                    return
-
-                embed = discord.Embed(
-                    title="🛡️ Scam Prevention Statistics",
-                    color=discord.Color.blue(),
-                    timestamp=datetime.now(timezone.utc)
-                )
-                
-                # Get statistics
-                total_patterns = len(self.pattern_learner.known_patterns)
-                total_scammers = len(self.community_db.confirmed_scammers)
-                total_reports = sum(len(reports) for reports in self.community_db.scam_reports.values())
-                
-                embed.add_field(
-                    name="Known Patterns",
-                    value=f"🔍 {total_patterns} patterns identified",
-                    inline=True
-                )
-                
-                embed.add_field(
-                    name="Confirmed Scammers",
-                    value=f"🚫 {total_scammers} users",
-                    inline=True
-                )
-                
-                embed.add_field(
-                    name="Total Reports",
-                    value=f"📊 {total_reports} reports processed",
-                    inline=True
-                )
-                
-                await ctx.send(embed=embed)
-            except Exception as e:
-                await ctx.send(f"❌ An error occurred: {str(e)}")
-
         @self.command(name='checkuser', help='Check a user\'s trust rating and profile')
         async def checkuser(ctx, user: discord.Member = None):
             try:
@@ -1308,13 +1258,6 @@ class Enforcer(commands.Bot):
         async def scamdomains_error(ctx, error):
             if isinstance(error, commands.MissingPermissions):
                 await ctx.send("❌ You need the 'Manage Messages' permission to use this command!")
-            else:
-                await ctx.send(f"❌ An error occurred: {str(error)}")
-
-        @lockdown.error
-        async def lockdown_error(ctx, error):
-            if isinstance(error, commands.MissingPermissions):
-                await ctx.send("❌ You need the 'Administrator' permission to use this command!")
             else:
                 await ctx.send(f"❌ An error occurred: {str(error)}")
 
@@ -1626,44 +1569,71 @@ class Enforcer(commands.Bot):
             else:
                 await ctx.send(f"❌ An error occurred: {str(error)}")
 
-        @self.command(name='previewlink', help='Get a safe preview of a link')
+        @self.command(name='previewlink', help='Get a safe preview and safety score of a link')
         async def previewlink(ctx, url: str):
+            """Get a safe preview and safety score of a link"""
             try:
                 if not self.link_preview.is_safe_url(url):
                     await ctx.send("❌ Invalid or unsafe URL provided!")
                     return
 
                 async with ctx.typing():
+                    # Get safety score
+                    safety_info = self.link_preview.calculate_link_safety_score(url)
                     preview_url = await self.link_preview.get_screenshot(url)
                     
-                    if not preview_url:
-                        await ctx.send("❌ Could not generate preview for this link.")
-                        return
-
                     embed = discord.Embed(
-                        title="🔍 Link Preview",
-                        description=f"Preview for: {url}",
-                        color=discord.Color.blue()
+                        title="🔍 Link Analysis",
+                        description=f"Analysis for: {url}",
+                        color=discord.Color.blue() if safety_info['score'] >= 0.6 else 
+                              discord.Color.orange() if safety_info['score'] >= 0.4 else 
+                              discord.Color.red()
                     )
-                    embed.set_image(url=preview_url)
+                    
+                    # Add safety score
+                    embed.add_field(
+                        name="Safety Rating",
+                        value=f"**{safety_info['rating']}** ({safety_info['score']:.1%})",
+                        inline=True
+                    )
+                    
+                    # Add preview if available
+                    if preview_url:
+                        embed.set_image(url=preview_url)
+                    
+                    # Add warning reasons if any
+                    if safety_info['reasons']:
+                        embed.add_field(
+                            name="⚠️ Warning Signs",
+                            value="\n".join(f"• {reason}" for reason in safety_info['reasons']),
+                            inline=False
+                        )
+                    
+                    # Add recommendations based on score
+                    recommendations = []
+                    if safety_info['score'] < 0.4:
+                        recommendations.extend([
+                            "❌ Highly recommended to avoid this link",
+                            "⚠️ May be a phishing or scam attempt",
+                            "🛡️ Report to moderators if received in DM"
+                        ])
+                    elif safety_info['score'] < 0.6:
+                        recommendations.extend([
+                            "⚠️ Exercise caution with this link",
+                            "🔍 Verify sender's identity",
+                            "🛡️ Don't enter personal information"
+                        ])
+                    
+                    if recommendations:
+                        embed.add_field(
+                            name="Recommendations",
+                            value="\n".join(recommendations),
+                            inline=False
+                        )
+                    
                     embed.set_footer(text="Always be cautious with unknown links!")
                     
                     await ctx.send(embed=embed)
-            except Exception as e:
-                await ctx.send(f"❌ An error occurred: {str(e)}")
-
-        @self.command(name='staffchannel', help='Set up staff notification channel')
-        @commands.has_permissions(administrator=True)
-        async def staffchannel(ctx, action: str = "add"):
-            try:
-                if action.lower() == "add":
-                    await self.staff_notifier.add_notification_channel(ctx.guild.id, ctx.channel.id)
-                    await ctx.send("✅ This channel has been set up for staff notifications!")
-                elif action.lower() == "remove":
-                    await self.staff_notifier.remove_notification_channel(ctx.guild.id, ctx.channel.id)
-                    await ctx.send("✅ This channel will no longer receive staff notifications.")
-                else:
-                    await ctx.send("❌ Invalid action! Use `add` or `remove`")
             except Exception as e:
                 await ctx.send(f"❌ An error occurred: {str(e)}")
 
@@ -1787,12 +1757,81 @@ class Enforcer(commands.Bot):
             except Exception as e:
                 await ctx.send(f"❌ An error occurred: {str(e)}")
 
-        @staffchannel.error
-        async def staffchannel_error(ctx, error):
-            if isinstance(error, commands.MissingPermissions):
-                await ctx.send("❌ You need Administrator permission to manage staff channels!")
-            else:
-                await ctx.send(f"❌ An error occurred: {str(error)}")
+        @self.command(name='securityguide', help='View security guides and tips')
+        async def securityguide(ctx, topic: str = None):
+            """Display security guides and tips"""
+            try:
+                if not topic:
+                    # Show available topics
+                    embed = discord.Embed(
+                        title="📚 Security Guides",
+                        description="Available topics:",
+                        color=discord.Color.blue()
+                    )
+                    
+                    for topic_name in self.security_education.get_all_topics():
+                        guide = self.security_education.get_guide(topic_name)
+                        embed.add_field(
+                            name=guide['title'],
+                            value=guide['description'],
+                            inline=False
+                        )
+                    
+                    embed.set_footer(text="Use !securityguide <topic> to view a specific guide")
+                    await ctx.send(embed=embed)
+                    return
+                
+                guide = self.security_education.get_guide(topic.lower())
+                if not guide:
+                    await ctx.send("❌ Topic not found! Use !securityguide to see available topics.")
+                    return
+                
+                # Create main embed
+                embed = discord.Embed(
+                    title=guide['title'],
+                    description=guide['description'],
+                    color=discord.Color.blue()
+                )
+                
+                # Add content
+                embed.add_field(
+                    name="📝 Information",
+                    value="\n".join(guide['content']),
+                    inline=False
+                )
+                
+                # Add examples
+                embed.add_field(
+                    name="⚠️ Examples",
+                    value="\n".join(guide['examples']),
+                    inline=False
+                )
+                
+                # Add tips
+                embed.add_field(
+                    name="💡 Safety Tips",
+                    value="\n".join(guide['tips']),
+                    inline=False
+                )
+                
+                await ctx.send(embed=embed)
+                
+            except Exception as e:
+                await ctx.send(f"❌ An error occurred: {str(e)}")
+
+        @self.command(name='securitytip', help='Get a random security tip')
+        async def securitytip(ctx):
+            """Display a random security tip"""
+            try:
+                tip = self.security_education.get_random_tip()
+                embed = discord.Embed(
+                    title="💡 Security Tip",
+                    description=tip,
+                    color=discord.Color.blue()
+                )
+                await ctx.send(embed=embed)
+            except Exception as e:
+                await ctx.send(f"❌ An error occurred: {str(e)}")
 
     async def setup_hook(self):
         """Initialize async components"""
@@ -1807,7 +1846,7 @@ class Enforcer(commands.Bot):
         async def help_command(ctx):
             embed = discord.Embed(
                 title="🛡️ Enforcer Bot Commands",
-                description="Here are all available commands:",
+                description="Here are all available commands to help keep our community safe:",
                 color=discord.Color.blue()
             )
 
@@ -1819,17 +1858,7 @@ class Enforcer(commands.Bot):
                       "`!reportdm @user` - Report suspicious DMs\n"
                       "`!reportscam` - Report a scam attempt\n"
                       "`!checkname [@user]` - Check for similar usernames\n"
-                      "`!previewlink [url]` - Get a safe preview of a link",
-                inline=False
-            )
-
-            # Server Protection
-            embed.add_field(
-                name="🔒 Server Protection",
-                value="`!lockdown` - View lockdown status\n"
-                      "`!lockdown enable [duration]` - Enable lockdown\n"
-                      "`!lockdown disable` - Disable lockdown\n"
-                      "`!staffchannel add/remove` - Set up staff notification channel",
+                      "`!previewlink [url]` - Get a safe preview and security scan of a link",
                 inline=False
             )
 
@@ -1837,19 +1866,28 @@ class Enforcer(commands.Bot):
             embed.add_field(
                 name="🚫 Scam Prevention",
                 value="`!scamdomains list` - List known scam domains\n"
-                      "`!scamdomains add [domain]` - Add domain to blacklist\n"
-                      "`!scamdomains remove [domain]` - Remove domain from blacklist\n"
                       "`!scamexamples` - View examples of common scams",
                 inline=False
             )
 
-            # Statistics & Monitoring
+            # Security Education
             embed.add_field(
-                name="📊 Statistics",
-                value="`!recentscams` - View recent scam attempts\n"
-                      "`!scamstats` - View scam prevention stats",
+                name="📚 Security Education",
+                value="`!securityguide` - View security guides and topics\n"
+                      "`!securityguide [topic]` - View detailed guide on a topic\n"
+                      "`!securitytip` - Get a random security tip",
                 inline=False
             )
+
+            # Moderation Commands
+            if ctx.author.guild_permissions.manage_messages:
+                embed.add_field(
+                    name="🛠️ Moderation",
+                    value="`!recentscams` - View recent scam attempts in the server\n"
+                          "`!sharescam` - Share scam alerts with other servers\n"
+                          "`!scamdomains add/remove` - Manage scam domain blacklist",
+                    inline=False
+                )
 
             await ctx.send(embed=embed)
 
@@ -1870,33 +1908,102 @@ class Enforcer(commands.Bot):
         self.db.data['reported_users'][str(report.user_id)].append(asdict(report))
         self.db.save_data()
 
-        # Find logging channel
-        log_channel = None
+        # Find or create scam-logs channel
+        scam_log_channel = None
         for channel in guild.channels:
-            if channel.name in ['mod-logs', 'security-logs', 'incident-logs']:
-                log_channel = channel
+            if channel.name == 'scam-logs':
+                scam_log_channel = channel
                 break
 
-        if log_channel and isinstance(log_channel, discord.TextChannel):
+        # Create scam-logs channel if it doesn't exist
+        if not scam_log_channel:
+            try:
+                # Create channel with proper permissions
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(read_messages=False),
+                    guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+                }
+                # Try to find a "Logs" category
+                logs_category = None
+                for category in guild.categories:
+                    if 'log' in category.name.lower():
+                        logs_category = category
+                        break
+                
+                scam_log_channel = await guild.create_text_channel(
+                    'scam-logs',
+                    overwrites=overwrites,
+                    category=logs_category if logs_category else None,
+                    topic="Dedicated channel for scam reports and detection"
+                )
+            except discord.Forbidden:
+                # If can't create channel, try to use existing mod-logs
+                for channel in guild.channels:
+                    if channel.name in ['mod-logs', 'security-logs', 'incident-logs']:
+                        scam_log_channel = channel
+                        break
+
+        if scam_log_channel and isinstance(scam_log_channel, discord.TextChannel):
+            # Create detailed scam report embed
             embed = discord.Embed(
                 title="🚨 Scam Report",
-                description=f"User reported for suspicious activity",
+                description=f"New scam attempt reported",
                 color=discord.Color.red(),
                 timestamp=report.timestamp
             )
             
+            # Add report details
             embed.add_field(name="Reported User", value=f"<@{report.user_id}>", inline=True)
             embed.add_field(name="Reporter", value=f"<@{report.reporter_id}>", inline=True)
-            embed.add_field(name="Reason", value=report.reason, inline=False)
+            embed.add_field(name="Report Time", value=report.timestamp.strftime("%Y-%m-%d %H:%M:%S UTC"), inline=True)
+            
+            if report.reason:
+                embed.add_field(name="Reason", value=report.reason, inline=False)
             
             if report.message_content:
+                # Sanitize and truncate message content
+                content = report.message_content.replace('`', '\'')[:1000]
                 embed.add_field(
                     name="Message Content",
-                    value=f"```{report.message_content[:1000]}```",
+                    value=f"```{content}```",
                     inline=False
                 )
+            
+            # Add user info if available
+            try:
+                reported_user = await self.fetch_user(report.user_id)
+                if reported_user:
+                    account_age = (datetime.now(timezone.utc) - reported_user.created_at).days
+                    embed.add_field(
+                        name="Account Information",
+                        value=f"Account Age: {account_age} days\nUsername: {reported_user.name}\nID: {reported_user.id}",
+                        inline=False
+                    )
+            except:
+                pass
 
-            await log_channel.send(embed=embed)
+            # Add report ID and tracking info
+            report_id = hashlib.md5(f"{report.user_id}{report.timestamp}".encode()).hexdigest()[:8]
+            embed.set_footer(text=f"Report ID: {report_id} | Use !checkuser @user for more details")
+
+            await scam_log_channel.send(embed=embed)
+
+            # Also send to general mod-logs if different from scam-logs
+            if scam_log_channel.name == 'scam-logs':
+                for channel in guild.channels:
+                    if channel.name in ['mod-logs', 'security-logs', 'incident-logs']:
+                        if isinstance(channel, discord.TextChannel) and channel.id != scam_log_channel.id:
+                            # Create a shorter version for mod-logs
+                            mod_embed = discord.Embed(
+                                title="🚨 Scam Report",
+                                description=f"New scam report - See #scam-logs for details",
+                                color=discord.Color.red(),
+                                timestamp=report.timestamp
+                            )
+                            mod_embed.add_field(name="Report ID", value=report_id, inline=True)
+                            mod_embed.add_field(name="Reported User", value=f"<@{report.user_id}>", inline=True)
+                            await channel.send(embed=mod_embed)
+                            break
 
     async def log_security_incident(self, guild: discord.Guild, message: str, level: str = "INFO"):
         """Log a security incident to the appropriate channel"""
@@ -2023,18 +2130,6 @@ class Enforcer(commands.Bot):
 
         # Only process guild messages beyond this point
         if not isinstance(message.guild, discord.Guild):
-            return
-
-        # Check lockdown restrictions
-        if await self.check_lockdown_restrictions(message):
-            try:
-                await message.delete()
-                await message.channel.send(
-                    f"{message.author.mention} Your message was removed due to server lockdown restrictions.",
-                    delete_after=10
-                )
-            except discord.Forbidden:
-                pass
             return
 
         # Analyze message for spam/scams
@@ -2275,55 +2370,6 @@ class Enforcer(commands.Bot):
 
         await ctx.send(embed=embed)
 
-    @commands.command(name='lockdown')
-    @commands.has_permissions(administrator=True)
-    async def server_lockdown(self, ctx, action: str = None, duration: int = 60):
-        """Enable or disable server lockdown mode"""
-        if action is None:
-            # Show current status
-            settings = self.lockdown_settings[ctx.guild.id]
-            if settings['active']:
-                time_remaining = (settings['start_time'] + timedelta(minutes=duration) - datetime.now(timezone.utc)).total_seconds() / 60
-                await ctx.send(f"🔒 Server is in lockdown mode. {time_remaining:.1f} minutes remaining.")
-            else:
-                await ctx.send("🔓 Server is not in lockdown mode.")
-            return
-
-        if action.lower() == 'enable':
-            self.lockdown_settings[ctx.guild.id]['active'] = True
-            self.lockdown_settings[ctx.guild.id]['start_time'] = datetime.now(timezone.utc)
-            
-            embed = discord.Embed(
-                title="🔒 Server Lockdown Enabled",
-                description="Emergency protection measures are now active:",
-                color=discord.Color.red()
-            )
-            embed.add_field(
-                name="Restrictions",
-                value="• DMs between members blocked\n"
-                      "• Server invites blocked\n"
-                      "• Links blocked\n"
-                      f"• Minimum account age: {self.lockdown_settings[ctx.guild.id]['restrictions']['minimum_age']} days",
-                inline=False
-            )
-            embed.add_field(
-                name="Duration",
-                value=f"Lockdown will last for {duration} minutes",
-                inline=False
-            )
-            
-            await ctx.send(embed=embed)
-            
-            # Schedule lockdown end
-            await asyncio.sleep(duration * 60)
-            if self.lockdown_settings[ctx.guild.id]['active']:
-                self.lockdown_settings[ctx.guild.id]['active'] = False
-                await ctx.send("🔓 Lockdown period has ended. Server restrictions lifted.")
-                
-        elif action.lower() == 'disable':
-            self.lockdown_settings[ctx.guild.id]['active'] = False
-            await ctx.send("🔓 Lockdown mode disabled. Server restrictions lifted.")
-
     @commands.command(name='sharescam')
     @commands.has_permissions(manage_messages=True)
     async def share_scam_alert(self, ctx, *, details: str):
@@ -2357,69 +2403,6 @@ class Enforcer(commands.Bot):
 
         await ctx.send(f"✅ Scam alert shared with {shared_count} servers.")
 
-    async def check_lockdown_restrictions(self, message: discord.Message) -> bool:
-        """Check if a message violates lockdown restrictions"""
-        if not isinstance(message.guild, discord.Guild):
-            return False
-            
-        settings = self.lockdown_settings[message.guild.id]
-        if not settings['active']:
-            return False
-
-        # Check restrictions
-        if settings['restrictions']['block_links'] and re.search(r'https?://', message.content):
-            return True
-            
-        if settings['restrictions']['block_invites'] and re.search(r'discord\.gg|discordapp\.com/invite', message.content):
-            return True
-
-        return False
-
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        """Enhanced message handling with lockdown checks"""
-        if message.author.bot:
-            return
-
-        # Check lockdown restrictions
-        if isinstance(message.guild, discord.Guild) and await self.check_lockdown_restrictions(message):
-            try:
-                await message.delete()
-                await message.channel.send(
-                    f"{message.author.mention} Your message was removed due to server lockdown restrictions.",
-                    delete_after=10
-                )
-            except discord.Forbidden:
-                pass
-            return
-
-        # Continue with normal message processing
-        await super().on_message(message)
-
-    @property
-    def scam_detector(self):
-        if self._scam_detector is None:
-            self._scam_detector = ScamDetector()
-        return self._scam_detector
-    
-    @property
-    def message_analyzer(self):
-        if self._message_analyzer is None:
-            self._message_analyzer = MessageAnalyzer()
-        return self._message_analyzer
-    
-    @property
-    def raid_protector(self):
-        if self._raid_protector is None:
-            self._raid_protector = RaidProtector()
-        return self._raid_protector
-    
-    @property
-    def verification_system(self):
-        if self._verification_system is None:
-            self._verification_system = VerificationSystem()
-        return self._verification_system
-    
     async def cleanup_old_data(self):
         """Cleanup old data to free memory"""
         current_time = time.time()
@@ -2470,4 +2453,233 @@ class Enforcer(commands.Bot):
         )
         
         await ctx.send(embed=embed)
+
+class SmartLinkProtection:
+    def __init__(self):
+        self.vt_api_key = None  # Will be set via configuration
+        self.cache = {}
+        self.cache_duration = 3600  # 1 hour
+        self.ssl_verify = True
+        self.ocr_enabled = True
+        
+    async def scan_url(self, url: str) -> dict:
+        """Comprehensive URL scan with multiple security checks"""
+        try:
+            results = {
+                'safe': True,
+                'threats': [],
+                'details': {},
+                'recommendations': []
+            }
+            
+            # Check cache first
+            cache_key = hashlib.md5(url.encode()).hexdigest()
+            if cache_key in self.cache:
+                if time.time() - self.cache[cache_key]['timestamp'] < self.cache_duration:
+                    return self.cache[cache_key]['results']
+            
+            # Basic URL validation
+            parsed = urlparse(url)
+            if not all([parsed.scheme, parsed.netloc]):
+                results['safe'] = False
+                results['threats'].append("Invalid URL format")
+                return results
+            
+            # Domain age check using WHOIS
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f'https://whois.whoisxmlapi.com/api/v1?apiKey={self.vt_api_key}&domainName={parsed.netloc}') as response:
+                        if response.status == 200:
+                            whois_data = await response.json()
+                            creation_date = whois_data.get('creationDate')
+                            if creation_date:
+                                domain_age_days = (datetime.now() - datetime.fromisoformat(creation_date)).days
+                                if domain_age_days < 30:
+                                    results['threats'].append(f"Domain is only {domain_age_days} days old")
+                                results['details']['domain_age'] = domain_age_days
+            except Exception as e:
+                logging.warning(f"WHOIS lookup failed: {e}")
+            
+            # SSL certificate validation
+            if self.ssl_verify and parsed.scheme == 'https':
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url) as response:
+                            ssl_info = response.connection.transport.get_extra_info('ssl_object')
+                            if ssl_info:
+                                cert = ssl_info.getpeercert()
+                                results['details']['ssl_valid'] = bool(cert)
+                                if not cert:
+                                    results['threats'].append("Invalid SSL certificate")
+                except Exception as e:
+                    results['threats'].append("SSL verification failed")
+            
+            # VirusTotal API check
+            if self.vt_api_key:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        headers = {'x-apikey': self.vt_api_key}
+                        # URL scan
+                        scan_url = f'https://www.virustotal.com/vtapi/v2/url/report?apikey={self.vt_api_key}&resource={url}'
+                        async with session.get(scan_url, headers=headers) as response:
+                            if response.status == 200:
+                                vt_data = await response.json()
+                                if vt_data.get('positives', 0) > 0:
+                                    results['safe'] = False
+                                    results['threats'].append(f"VirusTotal detected {vt_data['positives']} threats")
+                                results['details']['vt_score'] = vt_data.get('positives', 0)
+                except Exception as e:
+                    logging.warning(f"VirusTotal API check failed: {e}")
+            
+            # OCR text analysis if enabled
+            if self.ocr_enabled:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url) as response:
+                            if 'image' in response.headers.get('content-type', ''):
+                                # Implement OCR analysis here
+                                pass
+                except Exception as e:
+                    logging.warning(f"OCR analysis failed: {e}")
+            
+            # Generate recommendations based on findings
+            if results['threats']:
+                results['recommendations'].extend([
+                    "Do not enter personal information on this site",
+                    "Avoid downloading files from this location",
+                    "Report this URL if received in a suspicious message"
+                ])
+            
+            # Cache results
+            self.cache[cache_key] = {
+                'timestamp': time.time(),
+                'results': results
+            }
+            
+            return results
+            
+        except Exception as e:
+            logging.error(f"URL scan failed: {e}")
+            return {
+                'safe': False,
+                'threats': ["Unable to complete security scan"],
+                'details': {},
+                'recommendations': ["Exercise caution with this URL"]
+            }
+
+    def configure(self, **kwargs):
+        """Configure the link protection settings"""
+        if 'vt_api_key' in kwargs:
+            self.vt_api_key = kwargs['vt_api_key']
+        if 'ssl_verify' in kwargs:
+            self.ssl_verify = kwargs['ssl_verify']
+        if 'ocr_enabled' in kwargs:
+            self.ocr_enabled = kwargs['ocr_enabled']
+        if 'cache_duration' in kwargs:
+            self.cache_duration = kwargs['cache_duration']
+
+class SecurityEducation:
+    def __init__(self):
+        self.guides = {
+            'phishing': {
+                'title': "🎣 Phishing Scams",
+                'description': "Learn to identify and avoid phishing attempts",
+                'content': [
+                    "Common signs of phishing:",
+                    "• Urgent or threatening language",
+                    "• Requests for personal information",
+                    "• Suspicious links or attachments",
+                    "• Poor grammar or spelling",
+                    "• Impersonation of official sources"
+                ],
+                'examples': [
+                    "❌ 'Your account will be suspended unless you verify now!'",
+                    "❌ 'Click here to claim your free Nitro!'",
+                    "❌ 'You've won a special prize! Enter your details...'"
+                ],
+                'tips': [
+                    "✅ Check the sender's full username and ID",
+                    "✅ Hover over links before clicking",
+                    "✅ Never enter login credentials from links",
+                    "✅ Report suspicious messages immediately"
+                ]
+            },
+            'impersonation': {
+                'title': "👤 Impersonation Scams",
+                'description': "Protect yourself from fake accounts",
+                'content': [
+                    "How to spot fake accounts:",
+                    "• Similar but slightly different usernames",
+                    "• Recently created accounts",
+                    "• Default or copied profile pictures",
+                    "• Claims of being official staff",
+                    "• Unusual behavior or requests"
+                ],
+                'examples': [
+                    "❌ Discord Staff impersonators",
+                    "❌ Fake moderator accounts",
+                    "❌ Copied profiles of known users"
+                ],
+                'tips': [
+                    "✅ Verify badges on official accounts",
+                    "✅ Check account creation date",
+                    "✅ Compare usernames carefully",
+                    "✅ Use !checkuser command for verification"
+                ]
+            },
+            'trading': {
+                'title': "💱 Trading Scams",
+                'description': "Stay safe while trading",
+                'content': [
+                    "Common trading scams:",
+                    "• Fake middlemen",
+                    "• Too-good-to-be-true offers",
+                    "• Pressure to trade quickly",
+                    "• Fake proof of items/currency",
+                    "• Bait and switch tactics"
+                ],
+                'examples': [
+                    "❌ 'Quick trade! Super rare item!'",
+                    "❌ 'I'll give you double back!'",
+                    "❌ 'Trust trade me!'"
+                ],
+                'tips': [
+                    "✅ Use official trading systems only",
+                    "✅ Never rush into trades",
+                    "✅ Screenshot all trade agreements",
+                    "✅ Report suspicious traders"
+                ]
+            }
+        }
+        self.tips_rotation = []
+        self.last_tip_time = 0
+        self.tip_interval = 3600  # 1 hour
+
+    def get_random_tip(self) -> str:
+        """Get a random security tip"""
+        all_tips = []
+        for guide in self.guides.values():
+            all_tips.extend(guide['tips'])
+        return random.choice(all_tips)
+
+    def get_guide(self, topic: str) -> Optional[dict]:
+        """Get a specific security guide"""
+        return self.guides.get(topic.lower())
+
+    def get_all_topics(self) -> List[str]:
+        """Get list of all available guide topics"""
+        return list(self.guides.keys())
+
+    async def send_periodic_tip(self, channel: discord.TextChannel):
+        """Send a periodic security tip to a channel"""
+        current_time = time.time()
+        if current_time - self.last_tip_time >= self.tip_interval:
+            tip = self.get_random_tip()
+            embed = discord.Embed(
+                title="💡 Security Tip",
+                description=tip,
+                color=discord.Color.blue()
+            )
+            await channel.send(embed=embed)
+            self.last_tip_time = current_time
  
