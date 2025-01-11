@@ -75,30 +75,24 @@ class MessageStore:
 class EnforcerDatabase:
     def __init__(self, filename: str = 'enforcer_data.json'):
         self.filename = filename
-        self.data = self.load_data()
+        self.data = self._create_default_data()  # Always start with default data
         self.message_store = MessageStore()
-        self.user_activities: Dict[int, UserActivity] = {}
-        self.known_scam_domains: Set[str] = set()
-        self.phishing_patterns: Set[str] = set()
-        self.suspicious_links: Dict[str, int] = defaultdict(int)
-        self.cached_user_risks: Dict[int, tuple] = {}
+        self.user_activities = {}
+        self.known_scam_domains = set()
+        self.phishing_patterns = set()
+        self.suspicious_links = defaultdict(int)
+        self.cached_user_risks = {}
         self.last_scan_time = datetime.now()
-
-    def load_data(self) -> dict:
-        try:
-            with open(self.filename, 'r') as f:
-                return json.load(f)
-        except FileNotFoundError:
-            return self._create_default_data()
+        self.save_data()  # Save the default data immediately
 
     def _create_default_data(self) -> dict:
         return {
             'guild_settings': {},
             'reported_users': {},
-            'verified_users': set(),
-            'trusted_users': set(),
-            'banned_patterns': set(),
-            'known_scammers': set(),
+            'verified_users': [],  # Changed from set() to list for JSON serialization
+            'trusted_users': [],   # Changed from set() to list for JSON serialization
+            'banned_patterns': [],  # Changed from set() to list for JSON serialization
+            'known_scammers': [],  # Changed from set() to list for JSON serialization
             'warning_history': {},
             'protection_settings': {},
             'custom_rules': {},
@@ -119,87 +113,9 @@ class EnforcerDatabase:
         """Save data with error handling"""
         try:
             with open(self.filename, 'w') as f:
-                json.dump(self.data, f)
+                json.dump(self.data, f, indent=4)
         except Exception as e:
             logging.error(f"Error saving safety data: {e}")
-
-class ModeratorVerification:
-    def __init__(self):
-        self.verified_roles = {}  # {guild_id: role_id}
-        self.verified_interactions = {}  # {user_id: [{"mod_id": int, "timestamp": datetime}]}
-
-    def set_mod_role(self, guild_id: int, role_id: int):
-        """Set the official moderator role for a guild"""
-        self.verified_roles[guild_id] = role_id
-
-    def is_verified_mod(self, member: discord.Member) -> bool:
-        """Check if a member is a verified moderator based on their role"""
-        guild_id = member.guild.id
-        if guild_id not in self.verified_roles:
-            return member.guild_permissions.administrator or member.guild_permissions.manage_messages
-            
-        mod_role = member.guild.get_role(self.verified_roles[guild_id])
-        return mod_role in member.roles or member.guild_permissions.administrator
-
-    def record_interaction(self, mod_id: int, user_id: int):
-        """Record a legitimate moderator interaction"""
-        if user_id not in self.verified_interactions:
-            self.verified_interactions[user_id] = []
-        
-        self.verified_interactions[user_id].append({
-            "mod_id": mod_id,
-            "timestamp": datetime.now(timezone.utc)
-        })
-
-    def get_recent_interactions(self, user_id: int) -> List[dict]:
-        """Get recent moderator interactions for a user"""
-        if user_id not in self.verified_interactions:
-            return []
-            
-        recent = [
-            interaction for interaction in self.verified_interactions[user_id]
-            if datetime.now(timezone.utc) - interaction["timestamp"] < timedelta(days=7)
-        ]
-        return recent
-
-class ReportButton(discord.ui.View):
-    def __init__(self, bot: 'Enforcer', suspicious_user: discord.User, message_content: str):
-        super().__init__(timeout=None)  # Buttons don't timeout
-        self.bot = bot
-        self.suspicious_user = suspicious_user
-        self.message_content = message_content
-
-    @discord.ui.button(label="🚨 Report Scam", style=discord.ButtonStyle.red)
-    async def report_scam(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Create report
-        report = ScamReport(
-            user_id=self.suspicious_user.id,
-            reporter_id=interaction.user.id,
-            timestamp=datetime.now(timezone.utc),
-            reason="Suspicious DM - One-Click Report",
-            evidence=self.message_content,
-            message_content=self.message_content,
-            channel_id=None
-        )
-        
-        # Process the report
-        for guild in interaction.user.mutual_guilds:
-            await self.bot.process_detailed_report(guild, report)
-        
-        await interaction.response.send_message("✅ Thank you for reporting! Our moderators have been notified.", ephemeral=True)
-        self.disable_all_items()
-        await interaction.message.edit(view=self)
-
-    @discord.ui.button(label="❌ Block User", style=discord.ButtonStyle.grey)
-    async def block_user(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            await interaction.user.block(self.suspicious_user)
-            await interaction.response.send_message(f"✅ Blocked {self.suspicious_user.mention}", ephemeral=True)
-        except:
-            await interaction.response.send_message("❌ Unable to block user", ephemeral=True)
-        
-        self.disable_all_items()
-        await interaction.message.edit(view=self)
 
 class TrustRating:
     def __init__(self):
@@ -537,6 +453,202 @@ class VerificationSystem:
         """Check if a user is verified"""
         return user_id in self.verified_users
 
+class ScamPatternLearner:
+    def __init__(self):
+        self.known_patterns = set()
+        self.reported_messages = []
+        self.confidence_thresholds = {
+            'high': 0.8,
+            'medium': 0.6,
+            'low': 0.4
+        }
+
+    async def learn_from_report(self, message_content: str, is_confirmed_scam: bool = True):
+        """Learn patterns from reported scam messages"""
+        if not message_content:
+            return
+        
+        # Extract key phrases (3-5 words)
+        words = message_content.lower().split()
+        for i in range(len(words)-2):
+            for length in range(3, 6):
+                if i + length <= len(words):
+                    phrase = ' '.join(words[i:i+length])
+                    if is_confirmed_scam:
+                        self.known_patterns.add(phrase)
+
+    async def analyze_similarity(self, message: str) -> dict:
+        """Analyze message similarity to known scam patterns"""
+        if not message:
+            return {'confidence': 0, 'matching_patterns': []}
+
+        message = message.lower()
+        matching_patterns = []
+        max_confidence = 0
+
+        for pattern in self.known_patterns:
+            similarity = difflib.SequenceMatcher(None, pattern, message).ratio()
+            if similarity > self.confidence_thresholds['low']:
+                matching_patterns.append({
+                    'pattern': pattern,
+                    'confidence': similarity
+                })
+                max_confidence = max(max_confidence, similarity)
+
+        return {
+            'confidence': max_confidence,
+            'matching_patterns': sorted(matching_patterns, key=lambda x: x['confidence'], reverse=True)[:3]
+        }
+
+class CommunityScamDB:
+    def __init__(self):
+        self.scam_reports = defaultdict(list)  # user_id -> list of reports
+        self.confirmed_scammers = set()
+        self.suspicious_users = defaultdict(int)  # user_id -> suspicion count
+        self.report_threshold = 3  # Number of reports needed to mark as confirmed scammer
+
+    async def add_report(self, user_id: int, reporter_id: int, evidence: str, guild_id: int):
+        """Add a new scam report to the database"""
+        report = {
+            'reporter_id': reporter_id,
+            'timestamp': datetime.now(timezone.utc),
+            'evidence': evidence,
+            'guild_id': guild_id
+        }
+        
+        self.scam_reports[user_id].append(report)
+        self.suspicious_users[user_id] += 1
+
+        # Check if user should be marked as confirmed scammer
+        if self.suspicious_users[user_id] >= self.report_threshold:
+            self.confirmed_scammers.add(user_id)
+            return True
+        return False
+
+    async def get_user_status(self, user_id: int) -> dict:
+        """Get the current status of a user"""
+        return {
+            'is_confirmed_scammer': user_id in self.confirmed_scammers,
+            'report_count': self.suspicious_users[user_id],
+            'recent_reports': self.scam_reports[user_id][-5:] if user_id in self.scam_reports else []
+        }
+
+class DMScreener:
+    def __init__(self):
+        self.safe_words = set(['hi', 'hello', 'hey', 'thanks', 'thank you', 'ok', 'okay'])
+        self.risky_patterns = [
+            r'free\s*(nitro|steam|gift)',
+            r'(steam|discord|nitro)\s*giveaway',
+            r'claim\s*your\s*(prize|reward|gift)',
+            r'limited\s*time\s*offer',
+            r'click\s*(here|this\s*link)',
+            r'urgent|hurry|quick|fast',
+            r'password|email|token'
+        ]
+        self.url_safety_cache = {}
+
+    async def screen_dm(self, content: str, sender_id: int, mutual_guilds: List[discord.Guild]) -> dict:
+        """Screen a DM for suspicious content"""
+        risk_factors = []
+        risk_score = 0
+
+        # Check message length
+        if len(content) < 10:
+            return {'is_safe': True, 'risk_score': 0, 'risk_factors': ['Short greeting message']}
+
+        # Check for safe greetings
+        words = set(content.lower().split())
+        if words.intersection(self.safe_words) and len(content) < 20:
+            return {'is_safe': True, 'risk_score': 0, 'risk_factors': ['Safe greeting message']}
+
+        # Check for risky patterns
+        for pattern in self.risky_patterns:
+            if re.search(pattern, content.lower()):
+                risk_factors.append(f"Contains suspicious pattern: {pattern}")
+                risk_score += 0.3
+
+        # Check for URLs
+        urls = re.findall(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+[^\s]*', content)
+        if urls:
+            risk_factors.append(f"Contains {len(urls)} URLs")
+            risk_score += 0.2 * len(urls)
+
+        # Check message characteristics
+        if content.isupper() or content.count('!') > 3:
+            risk_factors.append("Aggressive formatting")
+            risk_score += 0.1
+
+        if len(mutual_guilds) < 2:
+            risk_factors.append("Few mutual servers")
+            risk_score += 0.2
+
+        return {
+            'is_safe': risk_score < 0.5,
+            'risk_score': risk_score,
+            'risk_factors': risk_factors
+        }
+
+class UsernameImpersonationDetector:
+    def __init__(self):
+        self.protected_terms = {
+            'mod', 'admin', 'staff', 'moderator', 'administrator',
+            'official', 'support', 'helper', 'discord'
+        }
+        self.similarity_threshold = 0.85
+
+    def get_username_similarity(self, name1: str, name2: str) -> float:
+        """Calculate similarity between two usernames"""
+        # Remove common decorators and convert to lowercase
+        name1 = self._clean_username(name1)
+        name2 = self._clean_username(name2)
+        return difflib.SequenceMatcher(None, name1, name2).ratio()
+
+    def _clean_username(self, username: str) -> str:
+        """Clean username for comparison"""
+        # Convert to lowercase and remove common decorators
+        username = username.lower()
+        username = re.sub(r'[_\-\.\[\]\(\)]', '', username)
+        username = re.sub(r'\d+', '', username)  # Remove numbers
+        return username
+
+    async def check_impersonation(self, member: discord.Member, guild_members: List[discord.Member]) -> dict:
+        """Check if a member is trying to impersonate others"""
+        results = {
+            'is_impersonating': False,
+            'matched_users': [],
+            'protected_term_used': False,
+            'risk_level': 'LOW'
+        }
+
+        username = member.name.lower()
+        display_name = member.display_name.lower()
+
+        # Check for protected terms
+        for term in self.protected_terms:
+            if term in username or term in display_name:
+                results['protected_term_used'] = True
+                results['risk_level'] = 'MEDIUM'
+
+        # Compare with other members' names
+        for other in guild_members:
+            if other.id == member.id:
+                continue
+
+            # Check if other member has mod permissions
+            if other.guild_permissions.manage_messages or other.guild_permissions.administrator:
+                username_similarity = self.get_username_similarity(member.name, other.name)
+                display_name_similarity = self.get_username_similarity(member.display_name, other.display_name)
+
+                if username_similarity > self.similarity_threshold or display_name_similarity > self.similarity_threshold:
+                    results['is_impersonating'] = True
+                    results['risk_level'] = 'HIGH'
+                    results['matched_users'].append({
+                        'user': other,
+                        'similarity': max(username_similarity, display_name_similarity)
+                    })
+
+        return results
+
 class Enforcer(commands.Bot):
     def __init__(self, **options):
         intents = discord.Intents.default()
@@ -555,7 +667,6 @@ class Enforcer(commands.Bot):
         
         # Initialize components
         self.db = EnforcerDatabase()
-        self.moderator_verification = ModeratorVerification()
         self.trust_rating = TrustRating()
         self.profile_analyzer = ProfileAnalyzer()
         self._scam_detector = None
@@ -588,73 +699,582 @@ class Enforcer(commands.Bot):
             }
         })
 
+        # Add new components
+        self.pattern_learner = ScamPatternLearner()
+        self.community_db = CommunityScamDB()
+        self.dm_screener = DMScreener()
+        self.username_detector = UsernameImpersonationDetector()
+
+        # Add commands
+        self.add_commands()
+
+    def add_commands(self):
+        """Add all commands to the bot"""
+        
+        # Remove default help command first
+        self.remove_command('help')
+
+        @self.command(name='help', help='Shows all available commands')
+        async def help_command(ctx):
+            embed = discord.Embed(
+                title="🛡️ Enforcer Bot Commands",
+                description="Here are all available commands:",
+                color=discord.Color.blue()
+            )
+
+            # User Safety Commands
+            embed.add_field(
+                name="🛡️ User Safety",
+                value="`!scaminfo` - Learn about common scams and safety tips\n"
+                      "`!checkuser @user` - Check a user's trust rating\n"
+                      "`!reportdm @user` - Report suspicious DMs",
+                inline=False
+            )
+
+            # Server Protection
+            embed.add_field(
+                name="🔒 Server Protection",
+                value="`!lockdown` - View lockdown status\n"
+                      "`!lockdown enable [duration]` - Enable lockdown\n"
+                      "`!lockdown disable` - Disable lockdown",
+                inline=False
+            )
+
+            # Scam Prevention
+            embed.add_field(
+                name="🚫 Scam Prevention",
+                value="`!scamdomains list` - List known scam domains\n"
+                      "`!scamdomains add [domain]` - Add domain to blacklist\n"
+                      "`!scamdomains remove [domain]` - Remove domain from blacklist",
+                inline=False
+            )
+
+            # Statistics & Monitoring
+            embed.add_field(
+                name="📊 Statistics",
+                value="`!recentscams` - View recent scam attempts\n"
+                      "`!scamstats` - View scam prevention stats",
+                inline=False
+            )
+
+            await ctx.send(embed=embed)
+
+        @self.command(name='scaminfo', help='Learn about common scams and safety tips')
+        async def scaminfo(ctx):
+            try:
+                embed = discord.Embed(
+                    title="🛡️ Scam Awareness Guide",
+                    description="Learn about common Discord scams and how to stay safe",
+                    color=discord.Color.blue()
+                )
+
+                embed.add_field(
+                    name="Common Scam Types",
+                    value="• Free Nitro Scams\n"
+                          "• Steam Gift Scams\n"
+                          "• Staff Impersonation\n"
+                          "• Fake Giveaways\n"
+                          "• Trading Scams",
+                    inline=False
+                )
+
+                embed.add_field(
+                    name="🚩 Red Flags",
+                    value="• Offers that seem too good to be true\n"
+                          "• Pressure to act quickly\n"
+                          "• Requests for personal information\n"
+                          "• Links to suspicious websites\n"
+                          "• Claims of being Discord staff",
+                    inline=False
+                )
+
+                embed.add_field(
+                    name="🛡️ Stay Safe",
+                    value="• Never click suspicious links\n"
+                          "• Don't download unknown files\n"
+                          "• Keep your token private\n"
+                          "• Enable 2FA\n"
+                          "• Report suspicious activity",
+                    inline=False
+                )
+
+                embed.add_field(
+                    name="📱 Useful Commands",
+                    value=f"`{ctx.prefix}checkuser` - Check user trust rating\n"
+                          f"`{ctx.prefix}reportdm` - Report suspicious DMs\n"
+                          f"`{ctx.prefix}recentscams` - View recent scam attempts",
+                    inline=False
+                )
+
+                await ctx.send(embed=embed)
+            except Exception as e:
+                await ctx.send(f"❌ An error occurred: {str(e)}")
+
+        @self.command(name='recentscams', help='View recent scam attempts in the server')
+        @commands.has_permissions(manage_messages=True)
+        async def recentscams(ctx, limit: int = 5):
+            try:
+                if not ctx.guild:
+                    await ctx.send("❌ This command can only be used in a server!")
+                    return
+
+                recent = self.scam_detector.recent_scams.get(ctx.guild.id, [])[-limit:]
+                
+                if not recent:
+                    await ctx.send("No recent scam attempts recorded!")
+                    return
+
+                embed = discord.Embed(
+                    title="Recent Scam Attempts",
+                    description=f"Last {len(recent)} detected scam attempts",
+                    color=discord.Color.red()
+                )
+
+                for i, scam in enumerate(recent, 1):
+                    embed.add_field(
+                        name=f"Attempt #{i}",
+                        value=f"**Categories:** {', '.join(scam['categories'])}\n"
+                              f"**Content:** ```{scam['content'][:200]}```\n"
+                              f"**Time:** {scam['timestamp'].strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                        inline=False
+                    )
+
+                await ctx.send(embed=embed)
+            except Exception as e:
+                await ctx.send(f"❌ An error occurred: {str(e)}")
+
+        @self.command(name='scamdomains')
+        @commands.has_permissions(manage_messages=True)
+        async def scamdomains(ctx, action: str = "list", domain: str = None):
+            try:
+                if not ctx.guild:
+                    await ctx.send("❌ This command can only be used in a server!")
+                    return
+
+                if action.lower() == 'list':
+                    domains = list(self.scam_detector.known_scam_domains)
+                    if not domains:
+                        await ctx.send("No domains in the blacklist.")
+                        return
+
+                    embed = discord.Embed(
+                        title="Blacklisted Domains",
+                        description="Currently known scam domains:",
+                        color=discord.Color.red()
+                    )
+                    
+                    # Split into chunks of 15 domains
+                    for i in range(0, len(domains), 15):
+                        chunk = domains[i:i+15]
+                        embed.add_field(
+                            name=f"Domains {i+1}-{i+len(chunk)}",
+                            value="\n".join(f"• `{domain}`" for domain in chunk),
+                            inline=False
+                        )
+                    
+                    await ctx.send(embed=embed)
+                    
+                elif action.lower() == 'add' and domain:
+                    await self.scam_detector.add_scam_domain(domain)
+                    await ctx.send(f"✅ Added `{domain}` to scam domain blacklist")
+                    
+                elif action.lower() == 'remove' and domain:
+                    await self.scam_detector.remove_scam_domain(domain)
+                    await ctx.send(f"✅ Removed `{domain}` from scam domain blacklist")
+                else:
+                    await ctx.send("❌ Invalid usage! Use `!scamdomains list` or `!scamdomains add/remove [domain]`")
+            except Exception as e:
+                await ctx.send(f"❌ An error occurred: {str(e)}")
+
+        @self.command(name='lockdown')
+        @commands.has_permissions(administrator=True)
+        async def lockdown(ctx, action: str = None, duration: int = 60):
+            try:
+                if not ctx.guild:
+                    await ctx.send("❌ This command can only be used in a server!")
+                    return
+
+                if action is None:
+                    # Show current status
+                    settings = self.lockdown_settings[ctx.guild.id]
+                    if settings['active']:
+                        time_remaining = (settings['start_time'] + timedelta(minutes=duration) - datetime.now(timezone.utc)).total_seconds() / 60
+                        await ctx.send(f"🔒 Server is in lockdown mode. {time_remaining:.1f} minutes remaining.")
+                    else:
+                        await ctx.send("🔓 Server is not in lockdown mode.")
+                    return
+
+                if action.lower() == 'enable':
+                    self.lockdown_settings[ctx.guild.id]['active'] = True
+                    self.lockdown_settings[ctx.guild.id]['start_time'] = datetime.now(timezone.utc)
+                    
+                    embed = discord.Embed(
+                        title="🔒 Server Lockdown Enabled",
+                        description="Emergency protection measures are now active:",
+                        color=discord.Color.red()
+                    )
+                    embed.add_field(
+                        name="Restrictions",
+                        value="• DMs between members blocked\n"
+                              "• Server invites blocked\n"
+                              "• Links blocked\n"
+                              f"• Minimum account age: {self.lockdown_settings[ctx.guild.id]['restrictions']['minimum_age']} days",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="Duration",
+                        value=f"Lockdown will last for {duration} minutes",
+                        inline=False
+                    )
+                    
+                    await ctx.send(embed=embed)
+                    
+                    # Schedule lockdown end
+                    await asyncio.sleep(duration * 60)
+                    if self.lockdown_settings[ctx.guild.id]['active']:
+                        self.lockdown_settings[ctx.guild.id]['active'] = False
+                        await ctx.send("🔓 Lockdown period has ended. Server restrictions lifted.")
+                        
+                elif action.lower() == 'disable':
+                    self.lockdown_settings[ctx.guild.id]['active'] = False
+                    await ctx.send("🔓 Lockdown mode disabled. Server restrictions lifted.")
+                else:
+                    await ctx.send("❌ Invalid action! Use `enable` or `disable`")
+            except Exception as e:
+                await ctx.send(f"❌ An error occurred: {str(e)}")
+
+        @self.command(name='scamstats')
+        async def scamstats(ctx):
+            try:
+                if not ctx.guild:
+                    await ctx.send("❌ This command can only be used in a server!")
+                    return
+
+                embed = discord.Embed(
+                    title="🛡️ Scam Prevention Statistics",
+                    color=discord.Color.blue(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                
+                # Get statistics
+                total_patterns = len(self.pattern_learner.known_patterns)
+                total_scammers = len(self.community_db.confirmed_scammers)
+                total_reports = sum(len(reports) for reports in self.community_db.scam_reports.values())
+                
+                embed.add_field(
+                    name="Known Patterns",
+                    value=f"🔍 {total_patterns} patterns identified",
+                    inline=True
+                )
+                
+                embed.add_field(
+                    name="Confirmed Scammers",
+                    value=f"🚫 {total_scammers} users",
+                    inline=True
+                )
+                
+                embed.add_field(
+                    name="Total Reports",
+                    value=f"📊 {total_reports} reports processed",
+                    inline=True
+                )
+                
+                await ctx.send(embed=embed)
+            except Exception as e:
+                await ctx.send(f"❌ An error occurred: {str(e)}")
+
+        @self.command(name='checkuser', help='Check a user\'s trust rating and profile')
+        async def checkuser(ctx, user: discord.Member = None):
+            try:
+                if not ctx.guild:
+                    await ctx.send("❌ This command can only be used in a server!")
+                    return
+
+                # If no user is specified, check the command author
+                target_user = user or ctx.author
+
+                # Get trust score
+                trust_info = await self.trust_rating.calculate_trust_score(target_user, [ctx.guild])
+                
+                # Get profile analysis
+                profile_analysis = await self.profile_analyzer.analyze_profile(target_user)
+                
+                # Check community database
+                community_status = await self.community_db.get_user_status(target_user.id)
+
+                embed = discord.Embed(
+                    title=f"User Trust Analysis: {target_user.name}",
+                    color=discord.Color.blue() if trust_info['score'] > 0.6 else discord.Color.orange() if trust_info['score'] > 0.3 else discord.Color.red()
+                )
+
+                # Basic Info
+                created_ago = (datetime.now(timezone.utc) - target_user.created_at).days
+                joined_ago = (datetime.now(timezone.utc) - target_user.joined_at).days if target_user.joined_at else 0
+                
+                embed.add_field(
+                    name="👤 Basic Info",
+                    value=f"Account Age: {created_ago} days\n"
+                          f"Server Member: {joined_ago} days\n"
+                          f"Bot: {'Yes' if target_user.bot else 'No'}",
+                    inline=False
+                )
+
+                # Trust Score
+                embed.add_field(
+                    name="🛡️ Trust Rating",
+                    value=f"**{trust_info['rating']}** ({trust_info['score']:.1%})\n"
+                          + "\n".join(trust_info['reasons']) if trust_info['reasons'] else "No concerns",
+                    inline=False
+                )
+
+                # Profile Analysis
+                if profile_analysis['suspicious_elements']:
+                    embed.add_field(
+                        name="⚠️ Suspicious Elements",
+                        value="\n".join(f"• {element}" for element in profile_analysis['suspicious_elements']),
+                        inline=False
+                    )
+
+                # Community Database Info
+                if community_status['is_confirmed_scammer']:
+                    embed.add_field(
+                        name="🚫 WARNING",
+                        value="This user has been confirmed as a scammer!",
+                        inline=False
+                    )
+                elif community_status['report_count'] > 0:
+                    embed.add_field(
+                        name="📊 Reports",
+                        value=f"This user has been reported {community_status['report_count']} times",
+                        inline=False
+                    )
+
+                # Recommendations
+                if profile_analysis['recommendations']:
+                    embed.add_field(
+                        name="💡 Recommendations",
+                        value="\n".join(f"• {rec}" for rec in profile_analysis['recommendations']),
+                        inline=False
+                    )
+
+                await ctx.send(embed=embed)
+            except Exception as e:
+                await ctx.send(f"❌ An error occurred: {str(e)}")
+
+        @checkuser.error
+        async def checkuser_error(ctx, error):
+            if isinstance(error, commands.MemberNotFound):
+                await ctx.send("❌ Could not find that user! Make sure you're mentioning a valid server member.")
+            else:
+                await ctx.send(f"❌ An error occurred: {str(error)}")
+
+        # Error handlers for common issues
+        @recentscams.error
+        async def recentscams_error(ctx, error):
+            if isinstance(error, commands.MissingPermissions):
+                await ctx.send("❌ You need the 'Manage Messages' permission to use this command!")
+            else:
+                await ctx.send(f"❌ An error occurred: {str(error)}")
+
+        @scamdomains.error
+        async def scamdomains_error(ctx, error):
+            if isinstance(error, commands.MissingPermissions):
+                await ctx.send("❌ You need the 'Manage Messages' permission to use this command!")
+            else:
+                await ctx.send(f"❌ An error occurred: {str(error)}")
+
+        @lockdown.error
+        async def lockdown_error(ctx, error):
+            if isinstance(error, commands.MissingPermissions):
+                await ctx.send("❌ You need the 'Administrator' permission to use this command!")
+            else:
+                await ctx.send(f"❌ An error occurred: {str(error)}")
+
+        @self.command(name='reportdm', help='Report a user for suspicious DM behavior')
+        async def reportdm(ctx, user: discord.Member, *, reason: str = None):
+            try:
+                if not ctx.guild:
+                    await ctx.send("❌ This command can only be used in a server!")
+                    return
+
+                if user.bot:
+                    await ctx.send("❌ You cannot report bot accounts!")
+                    return
+
+                if user.id == ctx.author.id:
+                    await ctx.send("❌ You cannot report yourself!")
+                    return
+
+                # Create report
+                report = ScamReport(
+                    user_id=user.id,
+                    reporter_id=ctx.author.id,
+                    timestamp=datetime.now(timezone.utc),
+                    reason=reason or "Suspicious DM behavior",
+                    evidence="Reported via !reportdm command",
+                    message_content=None,
+                    channel_id=None
+                )
+
+                # Add to community database
+                is_confirmed = await self.community_db.add_report(
+                    user_id=user.id,
+                    reporter_id=ctx.author.id,
+                    evidence=f"DM Report: {reason}" if reason else "Suspicious DM behavior",
+                    guild_id=ctx.guild.id
+                )
+
+                # Process the report
+                await self.process_detailed_report(ctx.guild, report)
+
+                # Create response embed
+                embed = discord.Embed(
+                    title="DM Report Submitted",
+                    description=f"Report against {user.mention} has been recorded",
+                    color=discord.Color.orange(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+
+                embed.add_field(
+                    name="Reporter",
+                    value=ctx.author.mention,
+                    inline=True
+                )
+
+                embed.add_field(
+                    name="Reported User",
+                    value=f"{user.mention} ({user.id})",
+                    inline=True
+                )
+
+                if reason:
+                    embed.add_field(
+                        name="Reason",
+                        value=reason,
+                        inline=False
+                    )
+
+                if is_confirmed:
+                    embed.add_field(
+                        name="⚠️ Warning",
+                        value="This user has been marked as a confirmed scammer due to multiple reports!",
+                        inline=False
+                    )
+
+                # Get user trust info
+                trust_info = await self.trust_rating.calculate_trust_score(user, [ctx.guild])
+                embed.add_field(
+                    name="User Trust Rating",
+                    value=f"**{trust_info['rating']}** ({trust_info['score']:.1%})",
+                    inline=False
+                )
+
+                # Add recommendations
+                recommendations = [
+                    "• Block the user if you haven't already",
+                    "• Do not click any links they sent",
+                    "• Do not share personal information",
+                    "• Enable 'Safe Direct Messaging' in your Discord settings"
+                ]
+                embed.add_field(
+                    name="Recommended Actions",
+                    value="\n".join(recommendations),
+                    inline=False
+                )
+
+                await ctx.send(embed=embed)
+
+                # If the user is now a confirmed scammer, notify moderators
+                if is_confirmed:
+                    for guild in user.mutual_guilds:
+                        for channel in guild.channels:
+                            if channel.name in ['mod-logs', 'security-logs', 'incident-logs']:
+                                if isinstance(channel, discord.TextChannel):
+                                    alert_embed = discord.Embed(
+                                        title="🚨 Confirmed Scammer Alert",
+                                        description=f"{user.mention} has been marked as a confirmed scammer!",
+                                        color=discord.Color.red()
+                                    )
+                                    alert_embed.add_field(
+                                        name="User ID",
+                                        value=str(user.id),
+                                        inline=True
+                                    )
+                                    alert_embed.add_field(
+                                        name="Report Count",
+                                        value=str(len(self.community_db.scam_reports[user.id])),
+                                        inline=True
+                                    )
+                                    await channel.send(embed=alert_embed)
+                                    break
+
+            except Exception as e:
+                await ctx.send(f"❌ An error occurred: {str(e)}")
+
+        @reportdm.error
+        async def reportdm_error(ctx, error):
+            if isinstance(error, commands.MemberNotFound):
+                await ctx.send("❌ Could not find that user! Make sure you're mentioning a valid server member.")
+            elif isinstance(error, commands.MissingRequiredArgument):
+                await ctx.send("❌ Please specify a user to report! Usage: `!reportdm @user [reason]`")
+            else:
+                await ctx.send(f"❌ An error occurred: {str(error)}")
+
     async def setup_hook(self):
         """Initialize async components"""
         await super().setup_hook()
         self.loop.create_task(self.cleanup_old_data())
         
-        # Add commands
-        @self.command(name='checkuser', help='Check a user\'s trust rating and profile')
-        async def check_user(ctx, user: discord.User):
-            trust_info = await self.trust_rating.calculate_trust_score(user, user.mutual_guilds)
-            profile_analysis = await self.profile_analyzer.analyze_profile(user)
-            
+        # Remove default help command
+        self.remove_command('help')
+        
+        # Register commands
+        @self.command(name='help', help='Shows all available commands')
+        async def help_command(ctx):
             embed = discord.Embed(
-                title=f"User Analysis - {user.name}",
-                color=discord.Color.blue(),
-                timestamp=datetime.now(timezone.utc)
+                title="🛡️ Enforcer Bot Commands",
+                description="Here are all available commands:",
+                color=discord.Color.blue()
             )
-            
+
+            # User Safety Commands
             embed.add_field(
-                name="Trust Rating",
-                value=f"**{trust_info['rating']}** ({trust_info['score']:.2%})",
+                name="🛡️ User Safety",
+                value="`!scaminfo` - Learn about common scams and safety tips\n"
+                      "`!checkuser @user` - Check a user's trust rating\n"
+                      "`!reportdm @user` - Report suspicious DMs",
                 inline=False
             )
-            
-            if trust_info['reasons']:
-                embed.add_field(
-                    name="Trust Factors",
-                    value="\n".join(trust_info['reasons']),
-                    inline=False
-                )
-            
+
+            # Server Protection
+            embed.add_field(
+                name="🔒 Server Protection",
+                value="`!lockdown` - View lockdown status\n"
+                      "`!lockdown enable [duration]` - Enable lockdown\n"
+                      "`!lockdown disable` - Disable lockdown",
+                inline=False
+            )
+
+            # Scam Prevention
+            embed.add_field(
+                name="🚫 Scam Prevention",
+                value="`!scamdomains list` - List known scam domains\n"
+                      "`!scamdomains add [domain]` - Add domain to blacklist\n"
+                      "`!scamdomains remove [domain]` - Remove domain from blacklist",
+                inline=False
+            )
+
+            # Statistics & Monitoring
+            embed.add_field(
+                name="📊 Statistics",
+                value="`!recentscams` - View recent scam attempts\n"
+                      "`!scamstats` - View scam prevention stats",
+                inline=False
+            )
+
             await ctx.send(embed=embed)
 
-        @self.command(name='setmodrole', help='Set the official moderator role for the server')
-        @commands.has_permissions(administrator=True)
-        async def set_moderator_role(ctx, role: discord.Role):
-            self.moderator_verification.set_mod_role(ctx.guild.id, role.id)
-            await ctx.send(f"✅ {role.mention} has been set as the moderator role.")
-
-        @self.command(name='reportdm', help='Report a suspicious DM from a user')
-        async def report_dm(ctx, user: discord.User, *, reason: str = "Suspicious DM"):
-            report = ScamReport(
-                user_id=user.id,
-                reporter_id=ctx.author.id,
-                timestamp=datetime.now(timezone.utc),
-                reason=reason,
-                evidence="Manual report via command",
-                message_content=None,
-                channel_id=None
-            )
-            await self.process_detailed_report(ctx.guild, report)
-            await ctx.send(f"✅ Report submitted for {user.mention}")
-
-        @self.command(name='dmprotection', help='Configure DM protection settings')
-        @commands.has_permissions(administrator=True)
-        async def dm_protection(ctx, setting: str = None, value: str = None):
-            if setting is None:
-                settings = self.dm_protection[ctx.guild.id]
-                await ctx.send(f"DM Protection: {'Enabled' if settings['enabled'] else 'Disabled'}")
-                return
-
-            if setting == 'enable':
-                self.dm_protection[ctx.guild.id]['enabled'] = True
-                await ctx.send("✅ DM protection enabled")
-            elif setting == 'disable':
-                self.dm_protection[ctx.guild.id]['enabled'] = False
-                await ctx.send("✅ DM protection disabled")
-
+        # Print available commands
         print(f"Logged in as {self.user}")
         print("------")
         print("Available commands:")
@@ -726,62 +1346,87 @@ class Enforcer(commands.Bot):
             await log_channel.send(embed=embed)
 
     async def check_staff_impersonation(self, message: discord.Message, mutual_guilds: List[discord.Guild]) -> bool:
-        """Check if a message appears to be impersonating staff"""
+        """Enhanced check for staff impersonation"""
         content = message.content.lower()
         author = message.author
         
-        # Common staff-related terms
+        # Check message content for staff terms
         staff_terms = [
             'mod', 'admin', 'staff', 'official', 'discord staff',
             'moderator', 'administrator', 'support', 'helper'
         ]
         
-        # Check if message contains staff terms
-        if any(term in content for term in staff_terms):
-            # Check if user is actually staff in any mutual guild
-            is_real_staff = any(
-                self.moderator_verification.is_verified_mod(guild.get_member(author.id))
-                for guild in mutual_guilds
-                if guild.get_member(author.id)
-            )
-            
-            return not is_real_staff
+        content_suspicious = any(term in content for term in staff_terms)
+        
+        # Check username impersonation
+        username_check = await self.username_detector.check_impersonation(
+            author, 
+            message.guild.members if message.guild else []
+        )
 
-        return False
+        return content_suspicious or username_check['is_impersonating']
 
     async def handle_staff_impersonation(self, message: discord.Message):
-        """Handle a detected staff impersonation attempt"""
-        # Log the incident
-        for guild in message.author.mutual_guilds:
-            await self.log_security_incident(
-                guild,
-                f"🚫 Staff Impersonation Attempt Detected\n"
-                f"User: {message.author.mention}\n"
-                f"Content: ```{message.content}```",
-                level="HIGH"
+        """Enhanced handling of staff impersonation attempts"""
+        # Get detailed impersonation check
+        username_check = await self.username_detector.check_impersonation(
+            message.author,
+            message.guild.members if message.guild else []
+        )
+
+        # Create detailed alert
+        embed = discord.Embed(
+            title="🚫 Staff Impersonation Alert",
+            description="A user has been detected attempting to impersonate staff",
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        
+        embed.add_field(
+            name="User",
+            value=f"{message.author.mention} ({message.author.id})\n"
+                  f"Username: {message.author.name}\n"
+                  f"Display Name: {message.author.display_name}",
+            inline=False
+        )
+
+        if username_check['matched_users']:
+            similar_users = "\n".join(
+                f"• {user['user'].name} (Similarity: {user['similarity']:.1%})"
+                for user in username_check['matched_users']
+            )
+            embed.add_field(
+                name="Similar to Staff Members",
+                value=similar_users,
+                inline=False
             )
 
-        # Notify mutual guild moderators
-        for guild in message.author.mutual_guilds:
-            # Find mod channel
-            mod_channel = None
-            for channel in guild.channels:
-                if channel.name in ['mod-chat', 'moderator-only', 'staff-chat']:
-                    mod_channel = channel
-                    break
+        if username_check['protected_term_used']:
+            embed.add_field(
+                name="Protected Terms Used",
+                value="Username contains protected staff-related terms",
+                inline=False
+            )
 
-            if mod_channel and isinstance(mod_channel, discord.TextChannel):
-                embed = discord.Embed(
-                    title="🚫 Staff Impersonation Alert",
-                    description="A user has been detected attempting to impersonate staff",
-                    color=discord.Color.red(),
-                    timestamp=datetime.now(timezone.utc)
-                )
-                
-                embed.add_field(name="User", value=f"{message.author.mention} ({message.author.id})")
-                embed.add_field(name="Message", value=f"```{message.content}```")
-                
-                await mod_channel.send(embed=embed)
+        embed.add_field(
+            name="Risk Level",
+            value=f"⚠️ {username_check['risk_level']}",
+            inline=True
+        )
+
+        embed.add_field(
+            name="Message Content",
+            value=f"```{message.content}```",
+            inline=False
+        )
+
+        # Log to all appropriate channels in mutual guilds
+        for guild in message.author.mutual_guilds:
+            for channel in guild.channels:
+                if channel.name in ['security-logs', 'incident-logs']:
+                    if isinstance(channel, discord.TextChannel):
+                        await channel.send(embed=embed)
+                        break
 
     async def on_message(self, message: discord.Message):
         """Handle message events"""
@@ -851,70 +1496,65 @@ class Enforcer(commands.Bot):
             )
 
     async def handle_dm_message(self, message: discord.Message):
-        """Enhanced DM message handling"""
-        # Get mutual guilds with the sender
-        mutual_guilds = message.author.mutual_guilds
-        recipient = message.channel.recipient
+        """Enhanced DM message handling with advanced screening"""
+        # Screen the DM
+        screen_result = await self.dm_screener.screen_dm(
+            message.content,
+            message.author.id,
+            message.author.mutual_guilds
+        )
 
-        # Check DM protection settings in mutual guilds
-        protected_guilds = [
-            guild for guild in mutual_guilds
-            if self.dm_protection[guild.id]['enabled']
-        ]
+        # Learn from the message
+        if not screen_result['is_safe']:
+            await self.pattern_learner.learn_from_report(message.content, is_confirmed_scam=screen_result['risk_score'] > 0.7)
 
-        if protected_guilds:
-            # Check account age if any guild has new account blocking
-            account_age = (datetime.now(timezone.utc) - message.author.created_at).days
-            blocking_guilds = [
-                guild for guild in protected_guilds
-                if self.dm_protection[guild.id]['block_new_accounts'] and
-                account_age < self.dm_protection[guild.id]['minimum_age_days']
-            ]
+        # Check community database
+        user_status = await self.community_db.get_user_status(message.author.id)
+        
+        if user_status['is_confirmed_scammer']:
+            # Block message and notify recipient
+            warning = "⚠️ **CAUTION**: This user has been reported multiple times for scam attempts."
+            try:
+                await message.channel.send(warning)
+            except discord.Forbidden:
+                pass
+            return
 
-            if blocking_guilds:
-                # Block message and notify
-                await message.channel.send(
-                    "⚠️ This message was blocked due to server DM protection settings. "
-                    "The user's account is too new to send DMs."
-                )
-                return
-
-            # Get trust rating
-            trust_info = await self.trust_rating.calculate_trust_score(message.author, mutual_guilds)
+        if not screen_result['is_safe']:
+            # Create warning embed
+            embed = discord.Embed(
+                title="⚠️ Potential Scam Detected",
+                description="This message has been flagged as potentially suspicious:",
+                color=discord.Color.red()
+            )
             
-            # Warn recipient if enabled and trust score is low
-            if trust_info['score'] < 0.4:
-                warning_embed = discord.Embed(
-                    title="⚠️ Caution: Low Trust User",
-                    description="You're receiving a DM from a user with a low trust rating:",
-                    color=discord.Color.yellow()
-                )
-                warning_embed.add_field(
-                    name="Trust Score",
-                    value=f"**{trust_info['rating']}** ({trust_info['score']:.2%})",
-                    inline=False
-                )
-                if trust_info['reasons']:
-                    warning_embed.add_field(
-                        name="Reasons",
-                        value="\n".join(trust_info['reasons']),
-                        inline=False
-                    )
-                warning_embed.add_field(
-                    name="Recommendation",
-                    value="Be cautious with this interaction. You can use `!reportdm` to report suspicious behavior.",
-                    inline=False
-                )
-                
-                try:
-                    await recipient.send(embed=warning_embed)
-                except discord.Forbidden:
-                    pass
+            embed.add_field(
+                name="Risk Score",
+                value=f"{screen_result['risk_score']:.1%}",
+                inline=True
+            )
+            
+            embed.add_field(
+                name="Risk Factors",
+                value="\n".join(f"• {factor}" for factor in screen_result['risk_factors']),
+                inline=False
+            )
+            
+            embed.add_field(
+                name="Recommendation",
+                value="Be cautious with this message. You can use `!reportdm @user` to report if this is a scam attempt.",
+                inline=False
+            )
+            
+            try:
+                await message.channel.send(embed=embed)
+            except discord.Forbidden:
+                pass
 
-        # Continue with existing DM handling
+        # Continue with normal DM handling
         await super().handle_dm_message(message)
 
-    @commands.command(name='recentscams')
+    @commands.command(name='recentscams', help='View recent scam attempts in the server')
     @commands.has_permissions(manage_messages=True)
     async def recent_scams(self, ctx, limit: int = 5):
         """View recent scam attempts in the server"""
@@ -1007,8 +1647,8 @@ class Enforcer(commands.Bot):
             await self.scam_detector.remove_scam_domain(domain)
             await ctx.send(f"✅ Removed `{domain}` from scam domain blacklist")
 
-    @commands.command(name='scaminfo')
-    async def scam_information(self, ctx):
+    @commands.command(name='scaminfo', help='Learn about common scams and safety tips')
+    async def scam_info(self, ctx):
         """Show information about common scams and safety tips"""
         embed = discord.Embed(
             title="🛡️ Scam Awareness Guide",
@@ -1217,4 +1857,38 @@ class Enforcer(commands.Bot):
         
         for alert_id in old_alerts:
             del self.shared_scam_alerts[alert_id]
+
+    @commands.command(name='scamstats')
+    async def scam_statistics(self, ctx):
+        """View current scam prevention statistics"""
+        embed = discord.Embed(
+            title="🛡️ Scam Prevention Statistics",
+            color=discord.Color.blue(),
+            timestamp=datetime.now(timezone.utc)
+        )
+        
+        # Get statistics
+        total_patterns = len(self.pattern_learner.known_patterns)
+        total_scammers = len(self.community_db.confirmed_scammers)
+        total_reports = sum(len(reports) for reports in self.community_db.scam_reports.values())
+        
+        embed.add_field(
+            name="Known Patterns",
+            value=f"🔍 {total_patterns} patterns identified",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Confirmed Scammers",
+            value=f"🚫 {total_scammers} users",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="Total Reports",
+            value=f"📊 {total_reports} reports processed",
+            inline=True
+        )
+        
+        await ctx.send(embed=embed)
  
