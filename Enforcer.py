@@ -19,6 +19,7 @@ import time
 import random
 import string
 import os
+from urllib.parse import urlparse
 
 # Download required NLTK data
 try:
@@ -705,6 +706,169 @@ class UsernameImpersonationDetector:
 
         return results
 
+class LinkPreview:
+    def __init__(self):
+        self.preview_cache = {}
+        self.cache_duration = 3600  # 1 hour cache
+
+    async def get_screenshot(self, url: str) -> Optional[str]:
+        """Get a screenshot of a URL using Selenium Wire"""
+        try:
+            # Check cache first
+            if url in self.preview_cache:
+                cache_time, image = self.preview_cache[url]
+                if time.time() - cache_time < self.cache_duration:
+                    return image
+
+            # Use aiohttp to fetch OG meta tags for preview
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        return None
+                    
+                    html = await response.text()
+                    
+                    # Try to find OpenGraph image
+                    og_image_match = re.search(r'<meta property="og:image" content="([^"]+)"', html)
+                    if og_image_match:
+                        image_url = og_image_match.group(1)
+                        # Cache the result
+                        self.preview_cache[url] = (time.time(), image_url)
+                        return image_url
+
+            return None
+        except Exception as e:
+            logging.error(f"Error getting screenshot: {e}")
+            return None
+
+    def is_safe_url(self, url: str) -> bool:
+        """Basic URL safety check"""
+        try:
+            parsed = urlparse(url)
+            return all([
+                parsed.scheme in ('http', 'https'),
+                not any(c in url for c in ['<', '>', '"', "'"]),
+                len(url) < 2000
+            ])
+        except Exception:
+            return False
+
+class StaffNotifier:
+    def __init__(self):
+        self.notification_channels = defaultdict(set)  # guild_id -> set of channel_ids
+        self.last_notification = defaultdict(float)  # guild_id -> last notification time
+        self.cooldown = 300  # 5 minutes between notifications
+
+    async def add_notification_channel(self, guild_id: int, channel_id: int):
+        """Add a channel for staff notifications"""
+        self.notification_channels[guild_id].add(channel_id)
+
+    async def remove_notification_channel(self, guild_id: int, channel_id: int):
+        """Remove a channel from staff notifications"""
+        self.notification_channels[guild_id].discard(channel_id)
+
+    async def notify_staff(self, guild: discord.Guild, embed: discord.Embed, urgent: bool = False):
+        """Send notification to staff channels"""
+        current_time = time.time()
+        
+        # Check cooldown unless urgent
+        if not urgent and current_time - self.last_notification[guild.id] < self.cooldown:
+            return
+
+        self.last_notification[guild.id] = current_time
+        
+        # Add timestamp to embed
+        embed.timestamp = datetime.now(timezone.utc)
+        
+        # Send to all notification channels
+        for channel_id in self.notification_channels[guild.id]:
+            channel = guild.get_channel(channel_id)
+            if channel and isinstance(channel, discord.TextChannel):
+                try:
+                    await channel.send(
+                        content="🚨 **URGENT STAFF NOTIFICATION**" if urgent else None,
+                        embed=embed
+                    )
+                except discord.Forbidden:
+                    continue
+
+class UsernameChecker:
+    def __init__(self):
+        self.similar_cache = {}
+        self.protected_terms = {
+            'mod', 'admin', 'staff', 'moderator', 'administrator',
+            'official', 'support', 'helper', 'discord'
+        }
+        self.similarity_threshold = 0.85
+
+    def clean_username(self, username: str) -> str:
+        """Clean username for comparison"""
+        username = username.lower()
+        username = re.sub(r'[_\-\.\[\]\(\)]', '', username)
+        username = re.sub(r'\d+', '', username)
+        return username
+
+    async def find_similar_users(self, guild: discord.Guild, username: str) -> List[dict]:
+        """Find users with similar usernames"""
+        similar_users = []
+        cleaned_name = self.clean_username(username)
+        
+        for member in guild.members:
+            # Skip checking against self
+            if member.name == username:
+                continue
+                
+            cleaned_member_name = self.clean_username(member.name)
+            similarity = difflib.SequenceMatcher(None, cleaned_name, cleaned_member_name).ratio()
+            
+            if similarity > self.similarity_threshold:
+                similar_users.append({
+                    'user': member,
+                    'similarity': similarity
+                })
+
+        return sorted(similar_users, key=lambda x: x['similarity'], reverse=True)
+
+    def has_protected_terms(self, username: str) -> List[str]:
+        """Check if username contains protected terms"""
+        found_terms = []
+        lowered = username.lower()
+        
+        for term in self.protected_terms:
+            if term in lowered:
+                found_terms.append(term)
+                
+        return found_terms
+
+    async def analyze_username(self, member: discord.Member) -> dict:
+        """Analyze a username for potential issues"""
+        results = {
+            'similar_users': [],
+            'protected_terms': [],
+            'risk_level': 'LOW',
+            'recommendations': []
+        }
+        
+        # Check for similar usernames
+        similar = await self.find_similar_users(member.guild, member.name)
+        if similar:
+            results['similar_users'] = similar
+            results['risk_level'] = 'HIGH'
+            results['recommendations'].append(
+                f"User has similar name to {len(similar)} other member(s)"
+            )
+        
+        # Check for protected terms
+        protected = self.has_protected_terms(member.name)
+        if protected:
+            results['protected_terms'] = protected
+            results['risk_level'] = 'HIGH'
+            results['recommendations'].append(
+                f"Username contains protected terms: {', '.join(protected)}"
+            )
+        
+        return results
+
 class Enforcer(commands.Bot):
     def __init__(self, **options):
         intents = discord.Intents.default()
@@ -760,6 +924,9 @@ class Enforcer(commands.Bot):
         self.community_db = CommunityScamDB()
         self.dm_screener = DMScreener()
         self.username_detector = UsernameImpersonationDetector()
+        self.link_preview = LinkPreview()
+        self.staff_notifier = StaffNotifier()
+        self.username_checker = UsernameChecker()
 
         # Add commands
         self.add_commands()
@@ -784,7 +951,9 @@ class Enforcer(commands.Bot):
                 value="`!scaminfo` - Learn about common scams and safety tips\n"
                       "`!checkuser @user` - Check a user's trust rating\n"
                       "`!reportdm @user` - Report suspicious DMs\n"
-                      "`!reportscam` - Report a scam attempt",
+                      "`!reportscam` - Report a scam attempt\n"
+                      "`!checkname [@user]` - Check for similar usernames\n"
+                      "`!previewlink [url]` - Get a safe preview of a link",
                 inline=False
             )
 
@@ -793,7 +962,8 @@ class Enforcer(commands.Bot):
                 name="🔒 Server Protection",
                 value="`!lockdown` - View lockdown status\n"
                       "`!lockdown enable [duration]` - Enable lockdown\n"
-                      "`!lockdown disable` - Disable lockdown",
+                      "`!lockdown disable` - Disable lockdown\n"
+                      "`!staffchannel add/remove` - Set up staff notification channel",
                 inline=False
             )
 
@@ -802,7 +972,8 @@ class Enforcer(commands.Bot):
                 name="🚫 Scam Prevention",
                 value="`!scamdomains list` - List known scam domains\n"
                       "`!scamdomains add [domain]` - Add domain to blacklist\n"
-                      "`!scamdomains remove [domain]` - Remove domain from blacklist",
+                      "`!scamdomains remove [domain]` - Remove domain from blacklist\n"
+                      "`!scamexamples` - View examples of common scams",
                 inline=False
             )
 
@@ -1455,6 +1626,174 @@ class Enforcer(commands.Bot):
             else:
                 await ctx.send(f"❌ An error occurred: {str(error)}")
 
+        @self.command(name='previewlink', help='Get a safe preview of a link')
+        async def previewlink(ctx, url: str):
+            try:
+                if not self.link_preview.is_safe_url(url):
+                    await ctx.send("❌ Invalid or unsafe URL provided!")
+                    return
+
+                async with ctx.typing():
+                    preview_url = await self.link_preview.get_screenshot(url)
+                    
+                    if not preview_url:
+                        await ctx.send("❌ Could not generate preview for this link.")
+                        return
+
+                    embed = discord.Embed(
+                        title="🔍 Link Preview",
+                        description=f"Preview for: {url}",
+                        color=discord.Color.blue()
+                    )
+                    embed.set_image(url=preview_url)
+                    embed.set_footer(text="Always be cautious with unknown links!")
+                    
+                    await ctx.send(embed=embed)
+            except Exception as e:
+                await ctx.send(f"❌ An error occurred: {str(e)}")
+
+        @self.command(name='staffchannel', help='Set up staff notification channel')
+        @commands.has_permissions(administrator=True)
+        async def staffchannel(ctx, action: str = "add"):
+            try:
+                if action.lower() == "add":
+                    await self.staff_notifier.add_notification_channel(ctx.guild.id, ctx.channel.id)
+                    await ctx.send("✅ This channel has been set up for staff notifications!")
+                elif action.lower() == "remove":
+                    await self.staff_notifier.remove_notification_channel(ctx.guild.id, ctx.channel.id)
+                    await ctx.send("✅ This channel will no longer receive staff notifications.")
+                else:
+                    await ctx.send("❌ Invalid action! Use `add` or `remove`")
+            except Exception as e:
+                await ctx.send(f"❌ An error occurred: {str(e)}")
+
+        @self.command(name='checkname', help='Check for similar usernames')
+        async def checkname(ctx, member: discord.Member = None):
+            try:
+                target = member or ctx.author
+                analysis = await self.username_checker.analyze_username(target)
+                
+                embed = discord.Embed(
+                    title="👤 Username Analysis",
+                    description=f"Analysis for {target.mention}",
+                    color=discord.Color.red() if analysis['risk_level'] == 'HIGH' else discord.Color.green()
+                )
+                
+                if analysis['similar_users']:
+                    similar_list = []
+                    for entry in analysis['similar_users'][:5]:  # Show top 5
+                        user = entry['user']
+                        similarity = entry['similarity']
+                        similar_list.append(f"• {user.name} ({similarity:.1%} similar)")
+                    
+                    embed.add_field(
+                        name="⚠️ Similar Usernames Found",
+                        value="\n".join(similar_list),
+                        inline=False
+                    )
+
+                if analysis['protected_terms']:
+                    embed.add_field(
+                        name="🚫 Protected Terms Used",
+                        value="• " + "\n• ".join(analysis['protected_terms']),
+                        inline=False
+                    )
+
+                if analysis['recommendations']:
+                    embed.add_field(
+                        name="💡 Recommendations",
+                        value="• " + "\n• ".join(analysis['recommendations']),
+                        inline=False
+                    )
+
+                await ctx.send(embed=embed)
+            except Exception as e:
+                await ctx.send(f"❌ An error occurred: {str(e)}")
+
+        @self.command(name='scamexamples', help='View examples of common scams')
+        async def scamexamples(ctx):
+            try:
+                embeds = []
+                
+                # Nitro Scam Example
+                nitro_embed = discord.Embed(
+                    title="Free Nitro Scam",
+                    description="Common free Discord Nitro scam example",
+                    color=discord.Color.red()
+                )
+                nitro_embed.add_field(
+                    name="🎮 Example Message",
+                    value="```Hey! Discord is giving away free Nitro! Claim yours at: dlscord.gift/free-nitro```",
+                    inline=False
+                )
+                nitro_embed.add_field(
+                    name="🚩 Red Flags",
+                    value="• Misspelled domain (dlscord instead of discord)\n"
+                          "• Promises free Nitro\n"
+                          "• Suspicious link\n"
+                          "• Creates urgency",
+                    inline=False
+                )
+                embeds.append(nitro_embed)
+
+                # Steam Gift Scam Example
+                steam_embed = discord.Embed(
+                    title="Steam Gift Scam",
+                    description="Common Steam gift card scam example",
+                    color=discord.Color.red()
+                )
+                steam_embed.add_field(
+                    name="🎮 Example Message",
+                    value="```Hi! I'm quitting Steam and giving away my inventory! Claim free games: steamcommunnity.com/trade/gift```",
+                    inline=False
+                )
+                steam_embed.add_field(
+                    name="🚩 Red Flags",
+                    value="• Misspelled domain (communnity)\n"
+                          "• Too good to be true\n"
+                          "• Random DM\n"
+                          "• Suspicious link",
+                    inline=False
+                )
+                embeds.append(steam_embed)
+
+                # Staff Impersonation Example
+                staff_embed = discord.Embed(
+                    title="Staff Impersonation Scam",
+                    description="Common Discord staff impersonation scam",
+                    color=discord.Color.red()
+                )
+                staff_embed.add_field(
+                    name="👤 Example Message",
+                    value="```Hello, I am Discord Staff. Your account has been reported. Verify here to avoid suspension: discord.gift/verify```",
+                    inline=False
+                )
+                staff_embed.add_field(
+                    name="🚩 Red Flags",
+                    value="• Claims to be Discord staff\n"
+                          "• Creates fear/urgency\n"
+                          "• Suspicious link\n"
+                          "• Threatens account suspension",
+                    inline=False
+                )
+                embeds.append(staff_embed)
+
+                # Send all embeds
+                for embed in embeds:
+                    embed.set_footer(text="Always report scam attempts using !reportscam")
+                    await ctx.send(embed=embed)
+                    await asyncio.sleep(1)  # Small delay between embeds
+
+            except Exception as e:
+                await ctx.send(f"❌ An error occurred: {str(e)}")
+
+        @staffchannel.error
+        async def staffchannel_error(ctx, error):
+            if isinstance(error, commands.MissingPermissions):
+                await ctx.send("❌ You need Administrator permission to manage staff channels!")
+            else:
+                await ctx.send(f"❌ An error occurred: {str(error)}")
+
     async def setup_hook(self):
         """Initialize async components"""
         await super().setup_hook()
@@ -1478,7 +1817,9 @@ class Enforcer(commands.Bot):
                 value="`!scaminfo` - Learn about common scams and safety tips\n"
                       "`!checkuser @user` - Check a user's trust rating\n"
                       "`!reportdm @user` - Report suspicious DMs\n"
-                      "`!reportscam` - Report a scam attempt",
+                      "`!reportscam` - Report a scam attempt\n"
+                      "`!checkname [@user]` - Check for similar usernames\n"
+                      "`!previewlink [url]` - Get a safe preview of a link",
                 inline=False
             )
 
@@ -1487,7 +1828,8 @@ class Enforcer(commands.Bot):
                 name="🔒 Server Protection",
                 value="`!lockdown` - View lockdown status\n"
                       "`!lockdown enable [duration]` - Enable lockdown\n"
-                      "`!lockdown disable` - Disable lockdown",
+                      "`!lockdown disable` - Disable lockdown\n"
+                      "`!staffchannel add/remove` - Set up staff notification channel",
                 inline=False
             )
 
@@ -1496,7 +1838,8 @@ class Enforcer(commands.Bot):
                 name="🚫 Scam Prevention",
                 value="`!scamdomains list` - List known scam domains\n"
                       "`!scamdomains add [domain]` - Add domain to blacklist\n"
-                      "`!scamdomains remove [domain]` - Remove domain from blacklist",
+                      "`!scamdomains remove [domain]` - Remove domain from blacklist\n"
+                      "`!scamexamples` - View examples of common scams",
                 inline=False
             )
 
